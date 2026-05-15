@@ -46,7 +46,6 @@ fn main() {
     }
 
     let cam = Arc::new(Camera::new());
-    cam.start_preview_thread();
 
     let tl = Arc::new(timelapse::Timelapse::new());
 

@@ -1,5 +1,4 @@
-use std::fs::File;
-use std::io::{BufReader, Read, Write};
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -14,12 +13,57 @@ pub const SAVE_DIR:  &str = "/home/pi/Pictures/picam";
 pub const VIDEO_DIR: &str = "/home/pi/Videos/picam";
 pub const TL_DIR:    &str = "/home/pi/Pictures/timelapse";
 
-// Resolution used for the live preview subprocess.
-// Also used for recording (tee'd to file, then transcoded to MP4 by ffmpeg).
-const PREVIEW_W: u32 = 1280;
-const PREVIEW_H: u32 = 720;
+const PREVIEW_W: u32 = 800;
+const PREVIEW_H: u32 = 480;
+const RECORD_W:  u32 = 1920;
+const RECORD_H:  u32 = 1080;
+
+// ── FFI bindings ──────────────────────────────────────────────────────────────
+
+#[repr(C)]
+struct PicamHandle(std::ffi::c_void);
+
+type FrameCb = unsafe extern "C" fn(
+    data:   *const u8,
+    len:    usize,
+    width:  u32,
+    height: u32,
+    ctx:    *mut std::ffi::c_void,
+);
+
+#[link(name = "camera_ffi", kind = "static")]
+#[link(name = "camera")]
+#[link(name = "camera-base")]
+extern "C" {
+    fn picam_open(
+        preview_w: u32, preview_h: u32,
+        record_w:  u32, record_h:  u32,
+        preview_cb: FrameCb,
+        record_cb:  FrameCb,
+        ctx: *mut std::ffi::c_void,
+    ) -> *mut PicamHandle;
+
+    fn picam_close(cam: *mut PicamHandle);
+    fn picam_pause (cam: *mut PicamHandle);
+    fn picam_resume(cam: *mut PicamHandle);
+
+    fn picam_set_gain      (cam: *mut PicamHandle, gain: f32);
+    fn picam_set_shutter   (cam: *mut PicamHandle, us: i32);
+    fn picam_set_awb       (cam: *mut PicamHandle, mode_idx: i32);
+    fn picam_set_ev        (cam: *mut PicamHandle, ev: f32);
+    fn picam_set_contrast  (cam: *mut PicamHandle, v: f32);
+    fn picam_set_saturation(cam: *mut PicamHandle, v: f32);
+    fn picam_set_sharpness (cam: *mut PicamHandle, v: f32);
+    fn picam_set_brightness(cam: *mut PicamHandle, v: f32);
+    fn picam_set_roi       (cam: *mut PicamHandle, x: f32, y: f32, w: f32, h: f32);
+
+    fn picam_start_recording(cam: *mut PicamHandle);
+    fn picam_stop_recording (cam: *mut PicamHandle);
+    fn picam_is_recording   (cam: *mut PicamHandle) -> i32;
+}
 
 // ── Camera settings ───────────────────────────────────────────────────────────
+
 #[derive(Clone, Debug)]
 pub struct CameraSettings {
     pub iso_idx:     usize,
@@ -49,9 +93,9 @@ impl Default for CameraSettings {
     }
 }
 
-pub const ISO_VALUES: &[&str] = &["0", "100", "200", "400", "800", "1600", "3200"];
-pub const SHUTTER_SPEEDS: &[(&str, u64)] = &[
-    ("0",       0),
+pub const ISO_VALUES: &[&str]            = &["0", "100", "200", "400", "800", "1600", "3200"];
+pub const SHUTTER_SPEEDS: &[(&str, i32)] = &[
+    ("Auto",    0),
     ("1/4000",  250),
     ("1/1000",  1_000),
     ("1/500",   2_000),
@@ -64,104 +108,180 @@ pub const AWB_MODES: &[&str] = &[
     "auto", "incandescent", "tungsten", "fluorescent", "indoor", "daylight", "cloudy",
 ];
 
-impl CameraSettings {
-    fn build_args(&self) -> Vec<String> {
-        let mut args = vec![];
-        let iso: u32 = ISO_VALUES[self.iso_idx].parse().unwrap_or(0);
-        if iso > 0 {
-            args.extend(["--gain".into(), (iso as f32 / 100.0).to_string()]);
-        }
-        let shutter_us = SHUTTER_SPEEDS[self.shutter_idx].1;
-        if shutter_us > 0 {
-            args.extend(["--shutter".into(), shutter_us.to_string()]);
-        }
-        args.extend(["--awb".into(), AWB_MODES[self.awb_idx].into()]);
-        if self.ev.abs() > 0.01 {
-            args.extend(["--ev".into(), format!("{:.2}", self.ev)]);
-        }
-        args.extend(["--contrast".into(),   format!("{:.2}", self.contrast)]);
-        args.extend(["--saturation".into(), format!("{:.2}", self.saturation)]);
-        args.extend(["--sharpness".into(),  format!("{:.2}", self.sharpness)]);
-        args.extend(["--brightness".into(), format!("{:.2}", self.brightness)]);
-        if self.zoom > 1.01 {
-            let w = 1.0 / self.zoom;
-            let h = 1.0 / self.zoom;
-            let x = (1.0 - w) / 2.0;
-            let y = (1.0 - h) / 2.0;
-            args.extend(["--roi".into(), format!("{x:.4},{y:.4},{w:.4},{h:.4}")]);
-        }
-        args
-    }
-}
+// ── Camera events (preview frames) ───────────────────────────────────────────
 
-// ── Messages from camera thread to UI thread ──────────────────────────────────
 pub enum CameraEvent {
     Frame { rgba: Vec<u8>, width: u32, height: u32 },
 }
 
-// ── Recording state (written by start/stop, read by preview loop) ─────────────
+// ── Recording state ───────────────────────────────────────────────────────────
+
 struct RecordingState {
-    file:      File,
-    temp_path: PathBuf,   // raw MJPEG frames go here
-    out_path:  PathBuf,   // final MP4 destination
-    start:     Instant,
-    framerate: u32,
+    ffmpeg_stdin: std::process::ChildStdin,
+    ffmpeg_child: std::process::Child,
+    out_path:     PathBuf,
+    start:        Instant,
+}
+
+// ── FFI callback context (heap-pinned, shared with C++) ───────────────────────
+
+struct CallbackCtx {
+    frame_tx:  Sender<CameraEvent>,
+    recording: Arc<Mutex<Option<RecordingState>>>,
+}
+
+unsafe extern "C" fn on_preview_frame(
+    data: *const u8, len: usize, width: u32, height: u32,
+    ctx: *mut std::ffi::c_void,
+) {
+    let ctx = &*(ctx as *const CallbackCtx);
+    let nv12 = std::slice::from_raw_parts(data, len);
+    let rgba = nv12_to_rgba(nv12, width, height);
+    let _ = ctx.frame_tx.try_send(CameraEvent::Frame { rgba, width, height });
+}
+
+unsafe extern "C" fn on_record_frame(
+    data: *const u8, len: usize, _width: u32, _height: u32,
+    ctx: *mut std::ffi::c_void,
+) {
+    let ctx = &*(ctx as *const CallbackCtx);
+    let nv12 = std::slice::from_raw_parts(data, len);
+    if let Ok(mut rec) = ctx.recording.try_lock() {
+        if let Some(ref mut state) = *rec {
+            let _ = state.ffmpeg_stdin.write_all(nv12);
+        }
+    }
+}
+
+// ── NV12 → RGBA conversion ────────────────────────────────────────────────────
+
+fn nv12_to_rgba(nv12: &[u8], width: u32, height: u32) -> Vec<u8> {
+    let w = width  as usize;
+    let h = height as usize;
+    let y_plane  = &nv12[..w * h];
+    let uv_plane = &nv12[w * h..];
+    let mut rgba = vec![0u8; w * h * 4];
+
+    for row in 0..h {
+        for col in 0..w {
+            let y  = y_plane[row * w + col] as i32;
+            let uv = (row / 2) * w + (col & !1);
+            let u  = uv_plane[uv]     as i32 - 128;
+            let v  = uv_plane[uv + 1] as i32 - 128;
+
+            let r = (y + 1_402 * v / 1_000).clamp(0, 255) as u8;
+            let g = (y - 344 * u / 1_000 - 714 * v / 1_000).clamp(0, 255) as u8;
+            let b = (y + 1_772 * u / 1_000).clamp(0, 255) as u8;
+
+            let i = (row * w + col) * 4;
+            rgba[i]     = r;
+            rgba[i + 1] = g;
+            rgba[i + 2] = b;
+            rgba[i + 3] = 255;
+        }
+    }
+    rgba
 }
 
 // ── Camera ────────────────────────────────────────────────────────────────────
+
 pub struct Camera {
     pub settings: Arc<Mutex<CameraSettings>>,
-    frame_tx:     Sender<CameraEvent>,
     pub frame_rx: Receiver<CameraEvent>,
-    running:      Arc<AtomicBool>,
-    paused:       Arc<AtomicBool>,   // paused during still/timelapse captures
+    handle:       *mut PicamHandle,
     recording:    Arc<Mutex<Option<RecordingState>>>,
+    paused:       Arc<AtomicBool>,
+    // keeps callback context alive for the lifetime of the camera
+    _ctx:         Box<CallbackCtx>,
 }
+
+// SAFETY: PicamHandle is accessed only through the C FFI which is internally
+// synchronized via mutexes. The callbacks fire on a libcamera thread but only
+// access the separately-synchronized CallbackCtx fields.
+unsafe impl Send for Camera {}
+unsafe impl Sync for Camera {}
 
 impl Camera {
     pub fn new() -> Self {
-        let (tx, rx) = bounded(2);
-        Self {
-            settings:  Arc::new(Mutex::new(CameraSettings::default())),
-            frame_tx:  tx,
-            frame_rx:  rx,
-            running:   Arc::new(AtomicBool::new(true)),
-            paused:    Arc::new(AtomicBool::new(false)),
-            recording: Arc::new(Mutex::new(None)),
-        }
-    }
-
-    pub fn start_preview_thread(&self) {
-        let settings  = Arc::clone(&self.settings);
-        let tx        = self.frame_tx.clone();
-        let running   = Arc::clone(&self.running);
-        let paused    = Arc::clone(&self.paused);
-        let recording = Arc::clone(&self.recording);
-
         for d in [SAVE_DIR, VIDEO_DIR, TL_DIR] {
             let _ = std::fs::create_dir_all(d);
         }
 
-        thread::Builder::new()
-            .name("camera-preview".into())
-            .spawn(move || preview_loop(settings, tx, running, paused, recording))
-            .expect("spawn camera thread");
+        let (tx, rx) = bounded(4);
+        let recording = Arc::new(Mutex::new(None::<RecordingState>));
+
+        let ctx = Box::new(CallbackCtx {
+            frame_tx:  tx,
+            recording: Arc::clone(&recording),
+        });
+        let ctx_ptr = &*ctx as *const CallbackCtx as *mut std::ffi::c_void;
+
+        let handle = unsafe {
+            picam_open(
+                PREVIEW_W, PREVIEW_H,
+                RECORD_W,  RECORD_H,
+                on_preview_frame,
+                on_record_frame,
+                ctx_ptr,
+            )
+        };
+
+        if handle.is_null() {
+            panic!("[camera] picam_open failed — is the camera connected?");
+        }
+
+        Camera {
+            settings: Arc::new(Mutex::new(CameraSettings::default())),
+            frame_rx: rx,
+            handle,
+            recording,
+            paused: Arc::new(AtomicBool::new(false)),
+            _ctx: ctx,
+        }
     }
 
     pub fn update_settings(&self, s: CameraSettings) {
-        *self.settings.lock().unwrap() = s;
+        let prev = {
+            let mut lock = self.settings.lock().unwrap();
+            let prev = lock.clone();
+            *lock = s.clone();
+            prev
+        };
+        if settings_changed(&prev, &s) {
+            self.apply_settings(&s);
+        }
     }
 
-    fn pause_preview(&self) {
-        self.paused.store(true, Ordering::Relaxed);
-        thread::sleep(Duration::from_millis(600));
+    fn apply_settings(&self, s: &CameraSettings) {
+        let gain: f32 = ISO_VALUES[s.iso_idx].parse::<f32>().unwrap_or(0.0) / 100.0;
+        unsafe { picam_set_gain(self.handle, gain); }
+
+        let shutter_us = SHUTTER_SPEEDS[s.shutter_idx].1;
+        unsafe { picam_set_shutter(self.handle, shutter_us); }
+
+        unsafe { picam_set_awb(self.handle, s.awb_idx as i32); }
+
+        if s.ev.abs() > 0.01 {
+            unsafe { picam_set_ev(self.handle, s.ev); }
+        }
+        unsafe { picam_set_contrast  (self.handle, s.contrast);   }
+        unsafe { picam_set_saturation(self.handle, s.saturation); }
+        unsafe { picam_set_sharpness (self.handle, s.sharpness);  }
+        unsafe { picam_set_brightness(self.handle, s.brightness); }
+
+        if s.zoom > 1.01 {
+            let w = 1.0 / s.zoom;
+            let h = 1.0 / s.zoom;
+            let x = (1.0 - w) / 2.0;
+            let y = (1.0 - h) / 2.0;
+            unsafe { picam_set_roi(self.handle, x, y, w, h); }
+        } else {
+            unsafe { picam_set_roi(self.handle, 0.0, 0.0, 1.0, 1.0); }
+        }
     }
 
-    fn resume_preview(&self) {
-        self.paused.store(false, Ordering::Relaxed);
-    }
+    // ── Photo capture ─────────────────────────────────────────────────────────
 
-    // ── Photo capture (pauses preview while rpicam-still runs) ────────────────
     pub fn capture_photo(&self) -> Result<PathBuf> {
         if self.is_recording() {
             anyhow::bail!("Stop recording before taking a photo");
@@ -181,62 +301,75 @@ impl Camera {
             "--nopreview",
             "--immediate",
         ]);
-        for a in s.build_args() { cmd.arg(a); }
-        let result = cmd.status().context("rpicam-still failed");
+        for a in build_rpicam_args(&s) { cmd.arg(a); }
+        let status = cmd.status().context("rpicam-still failed");
         self.resume_preview();
 
-        let status = result?;
+        let status = status?;
         if !status.success() { anyhow::bail!("rpicam-still exited {:?}", status.code()); }
         Ok(path)
     }
 
-    // ── Video recording: tee MJPEG frames from the running preview stream ──────
-    pub fn start_recording(&self) -> Result<PathBuf> {
-        let ts        = timestamp_ms();
-        let temp_path = PathBuf::from(VIDEO_DIR).join(format!(".rec_{ts}.mjpeg"));
-        let out_path  = PathBuf::from(VIDEO_DIR).join(format!("VID_{ts}.mp4"));
+    fn pause_preview(&self) {
+        self.paused.store(true, Ordering::Relaxed);
+        unsafe { picam_pause(self.handle); }
+        thread::sleep(Duration::from_millis(200));
+    }
 
-        let file = File::create(&temp_path)
-            .with_context(|| format!("create temp recording {temp_path:?}"))?;
+    fn resume_preview(&self) {
+        unsafe { picam_resume(self.handle); }
+        self.paused.store(false, Ordering::Relaxed);
+    }
+
+    // ── Video recording ───────────────────────────────────────────────────────
+
+    pub fn start_recording(&self) -> Result<PathBuf> {
+        let ts       = timestamp_ms();
+        let out_path = PathBuf::from(VIDEO_DIR).join(format!("VID_{ts}.mp4"));
+
+        // Pipe NV12 frames directly into ffmpeg for real-time H264 encoding
+        let mut child = Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-f",         "rawvideo",
+                "-pix_fmt",   "nv12",
+                "-s",         &format!("{}x{}", RECORD_W, RECORD_H),
+                "-r",         "25",
+                "-i",         "pipe:0",
+                "-c:v",       "libx264",
+                "-preset",    "fast",
+                "-pix_fmt",   "yuv420p",
+                out_path.to_str().unwrap(),
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("ffmpeg spawn failed")?;
+
+        let stdin = child.stdin.take().expect("piped stdin");
 
         *self.recording.lock().unwrap() = Some(RecordingState {
-            file,
-            temp_path,
+            ffmpeg_stdin: stdin,
+            ffmpeg_child: child,
             out_path: out_path.clone(),
             start: Instant::now(),
-            framerate: 25,
         });
+
+        unsafe { picam_start_recording(self.handle); }
         Ok(out_path)
     }
 
-    /// Stop recording and transcode in the background.
-    /// `on_done` is called from a worker thread when the MP4 is ready.
     pub fn stop_recording(&self, on_done: impl FnOnce() + Send + 'static) -> Option<PathBuf> {
-        let state = self.recording.lock().unwrap().take()?;
-        let framerate  = state.framerate;
-        let temp_path  = state.temp_path.clone();
-        let out_path   = state.out_path.clone();
-        drop(state); // flush + close the temp file
+        unsafe { picam_stop_recording(self.handle); }
 
-        let tp = temp_path.clone();
-        let op = out_path.clone();
+        let state = self.recording.lock().unwrap().take()?;
+        let out_path = state.out_path.clone();
+
+        // Close the ffmpeg stdin pipe so ffmpeg finalises the file, then wait
         thread::spawn(move || {
-            let status = Command::new("ffmpeg")
-                .args([
-                    "-y",
-                    "-framerate", &framerate.to_string(),
-                    "-f", "mjpeg",
-                    "-i", tp.to_str().unwrap(),
-                    "-c:v", "libx264",
-                    "-preset", "fast",
-                    "-pix_fmt", "yuv420p",
-                    op.to_str().unwrap(),
-                ])
-                .status();
-            match status {
-                Ok(s) if s.success() => { let _ = std::fs::remove_file(&tp); }
-                _ => eprintln!("[rec] ffmpeg transcode failed, keeping {tp:?}"),
-            }
+            drop(state.ffmpeg_stdin); // EOF → ffmpeg writes trailer and exits
+            let _ = { let mut c = state.ffmpeg_child; c.wait() };
             on_done();
         });
 
@@ -254,7 +387,8 @@ impl Camera {
             .unwrap_or_default()
     }
 
-    // ── Timelapse frame ────────────────────────────────────────────────────────
+    // ── Timelapse frame ───────────────────────────────────────────────────────
+
     pub fn capture_timelapse_frame(&self, index: usize, session_dir: &str) -> Result<PathBuf> {
         let path = PathBuf::from(session_dir).join(format!("frame_{index:06}.jpg"));
         let s    = self.settings.lock().unwrap().clone();
@@ -270,139 +404,53 @@ impl Camera {
             "--nopreview",
             "--immediate",
         ]);
-        for a in s.build_args() { cmd.arg(a); }
-        let result = cmd.status().context("rpicam-still timelapse failed");
+        for a in build_rpicam_args(&s) { cmd.arg(a); }
+        let status = cmd.status().context("rpicam-still timelapse failed");
         self.resume_preview();
 
-        let status = result?;
+        let status = status?;
         if !status.success() { anyhow::bail!("rpicam-still exited {:?}", status.code()); }
         Ok(path)
     }
 
     pub fn stop(&self) {
-        self.running.store(false, Ordering::Relaxed);
         self.stop_recording(|| {});
+        unsafe { picam_close(self.handle); }
     }
 }
 
-// ── MJPEG preview loop ─────────────────────────────────────────────────────────
-fn preview_loop(
-    settings:  Arc<Mutex<CameraSettings>>,
-    tx:        Sender<CameraEvent>,
-    running:   Arc<AtomicBool>,
-    paused:    Arc<AtomicBool>,
-    recording: Arc<Mutex<Option<RecordingState>>>,
-) {
-    while running.load(Ordering::Relaxed) {
-        if paused.load(Ordering::Relaxed) {
-            thread::sleep(Duration::from_millis(100));
-            continue;
-        }
-        match run_preview_child(&settings, &tx, &running, &paused, &recording) {
-            Ok(_)  => {}
-            Err(e) => {
-                eprintln!("[camera] {e:#}");
-                thread::sleep(Duration::from_secs(2));
-            }
-        }
-        if running.load(Ordering::Relaxed) {
-            thread::sleep(Duration::from_millis(300));
-        }
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+fn build_rpicam_args(s: &CameraSettings) -> Vec<String> {
+    let mut args = vec![];
+    let iso: u32 = ISO_VALUES[s.iso_idx].parse().unwrap_or(0);
+    if iso > 0 {
+        args.extend(["--gain".into(), (iso as f32 / 100.0).to_string()]);
     }
-}
-
-fn run_preview_child(
-    settings:  &Arc<Mutex<CameraSettings>>,
-    tx:        &Sender<CameraEvent>,
-    running:   &Arc<AtomicBool>,
-    paused:    &Arc<AtomicBool>,
-    recording: &Arc<Mutex<Option<RecordingState>>>,
-) -> Result<()> {
-    let s = settings.lock().unwrap().clone();
-
-    let mut cmd = Command::new("rpicam-vid");
-    cmd.args([
-        "--output", "-",
-        "--timeout", "0",
-        "--rotation", "180",
-        "--width",  &PREVIEW_W.to_string(),
-        "--height", &PREVIEW_H.to_string(),
-        "--framerate", "25",
-        "--codec", "mjpeg",
-        "--nopreview",
-        "--flush",
-    ]);
-    for a in s.build_args() { cmd.arg(a); }
-    cmd.stdout(Stdio::piped()).stderr(Stdio::null());
-
-    let mut child  = cmd.spawn().context("rpicam-vid spawn")?;
-    let stdout     = child.stdout.take().expect("stdout piped");
-    let mut reader = BufReader::with_capacity(512 * 1024, stdout);
-
-    let mut buf:     Vec<u8> = Vec::with_capacity(512 * 1024);
-    let mut scratch: Vec<u8> = vec![0u8; 65536];
-    let mut soi_pos: Option<usize> = None;
-
-    while running.load(Ordering::Relaxed) && !paused.load(Ordering::Relaxed) {
-        let n = match reader.read(&mut scratch) {
-            Ok(0)  => break,
-            Ok(n)  => n,
-            Err(_) => break,
-        };
-        buf.extend_from_slice(&scratch[..n]);
-
-        loop {
-            // Locate SOI marker
-            if soi_pos.is_none() {
-                if let Some(i) = find_marker(&buf, 0xFF, 0xD8) {
-                    if i > 0 { buf.drain(..i); }
-                    soi_pos = Some(0);
-                } else {
-                    if buf.len() > 4 { buf.drain(..buf.len() - 4); }
-                    break;
-                }
-            }
-
-            // Locate EOI marker
-            let start = soi_pos.unwrap();
-            if let Some(eoi) = find_marker_from(&buf, 0xFF, 0xD9, start + 2) {
-                let end  = eoi + 2;
-                let jpeg = buf[start..end].to_vec();
-                buf.drain(..end);
-                soi_pos = None;
-
-                // ── Tee: write raw JPEG to recording file if active ────────
-                if let Ok(mut rec) = recording.try_lock() {
-                    if let Some(ref mut state) = *rec {
-                        let _ = state.file.write_all(&jpeg);
-                    }
-                }
-
-                // ── Decode for live preview display ────────────────────────
-                if let Ok(rgba) = decode_jpeg_rgba(&jpeg) {
-                    let _ = tx.try_send(CameraEvent::Frame {
-                        rgba,
-                        width:  PREVIEW_W,
-                        height: PREVIEW_H,
-                    });
-                }
-            } else {
-                break;
-            }
-        }
-
-        // Restart subprocess if settings changed
-        let new_s = settings.lock().unwrap().clone();
-        if settings_changed(&s, &new_s) { break; }
+    let shutter_us = SHUTTER_SPEEDS[s.shutter_idx].1;
+    if shutter_us > 0 {
+        args.extend(["--shutter".into(), shutter_us.to_string()]);
     }
-
-    let _ = child.kill();
-    let _ = child.wait();
-    Ok(())
+    args.extend(["--awb".into(), AWB_MODES[s.awb_idx].into()]);
+    if s.ev.abs() > 0.01 {
+        args.extend(["--ev".into(), format!("{:.2}", s.ev)]);
+    }
+    args.extend(["--contrast".into(),   format!("{:.2}", s.contrast)]);
+    args.extend(["--saturation".into(), format!("{:.2}", s.saturation)]);
+    args.extend(["--sharpness".into(),  format!("{:.2}", s.sharpness)]);
+    args.extend(["--brightness".into(), format!("{:.2}", s.brightness)]);
+    if s.zoom > 1.01 {
+        let w = 1.0 / s.zoom;
+        let h = 1.0 / s.zoom;
+        let x = (1.0 - w) / 2.0;
+        let y = (1.0 - h) / 2.0;
+        args.extend(["--roi".into(), format!("{x:.4},{y:.4},{w:.4},{h:.4}")]);
+    }
+    args
 }
 
 fn settings_changed(a: &CameraSettings, b: &CameraSettings) -> bool {
-    a.iso_idx != b.iso_idx
+    a.iso_idx     != b.iso_idx
         || a.shutter_idx != b.shutter_idx
         || a.awb_idx     != b.awb_idx
         || (a.ev         - b.ev).abs()         > 0.01
@@ -411,21 +459,6 @@ fn settings_changed(a: &CameraSettings, b: &CameraSettings) -> bool {
         || (a.sharpness  - b.sharpness).abs()  > 0.01
         || (a.brightness - b.brightness).abs() > 0.01
         || (a.zoom       - b.zoom).abs()        > 0.01
-}
-
-fn find_marker(buf: &[u8], b0: u8, b1: u8) -> Option<usize> {
-    buf.windows(2).position(|w| w[0] == b0 && w[1] == b1)
-}
-
-fn find_marker_from(buf: &[u8], b0: u8, b1: u8, from: usize) -> Option<usize> {
-    if from >= buf.len().saturating_sub(1) { return None; }
-    buf[from..].windows(2).position(|w| w[0] == b0 && w[1] == b1).map(|p| p + from)
-}
-
-fn decode_jpeg_rgba(jpeg: &[u8]) -> Result<Vec<u8>> {
-    let img  = image::load_from_memory_with_format(jpeg, image::ImageFormat::Jpeg)?;
-    let rgba = img.into_rgba8();
-    Ok(rgba.into_raw())
 }
 
 fn timestamp_ms() -> u128 {
@@ -438,41 +471,6 @@ fn timestamp_ms() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ── find_marker ────────────────────────────────────────────────────────────
-
-    #[test]
-    fn find_marker_finds_at_start() {
-        let buf = [0xFF, 0xD8, 0x00, 0x01];
-        assert_eq!(find_marker(&buf, 0xFF, 0xD8), Some(0));
-    }
-
-    #[test]
-    fn find_marker_finds_in_middle() {
-        let buf = [0x00, 0x01, 0xFF, 0xD9, 0x00];
-        assert_eq!(find_marker(&buf, 0xFF, 0xD9), Some(2));
-    }
-
-    #[test]
-    fn find_marker_returns_none_when_absent() {
-        let buf = [0x00, 0x01, 0x02, 0x03];
-        assert_eq!(find_marker(&buf, 0xFF, 0xD8), None);
-    }
-
-    #[test]
-    fn find_marker_from_skips_before_offset() {
-        let buf = [0xFF, 0xD9, 0x00, 0xFF, 0xD9];
-        // skip the first occurrence at 0, find the one at 3
-        assert_eq!(find_marker_from(&buf, 0xFF, 0xD9, 2), Some(3));
-    }
-
-    #[test]
-    fn find_marker_from_offset_past_end_returns_none() {
-        let buf = [0xFF, 0xD9];
-        assert_eq!(find_marker_from(&buf, 0xFF, 0xD9, 10), None);
-    }
-
-    // ── settings_changed ──────────────────────────────────────────────────────
 
     #[test]
     fn settings_changed_identical_returns_false() {
@@ -492,7 +490,7 @@ mod tests {
     fn settings_changed_ev_small_delta_returns_false() {
         let a = CameraSettings::default();
         let mut b = a.clone();
-        b.ev = 0.005; // below 0.01 threshold
+        b.ev = 0.005;
         assert!(!settings_changed(&a, &b));
     }
 
@@ -506,78 +504,129 @@ mod tests {
 
     #[test]
     fn settings_changed_zoom_threshold() {
-        let a = CameraSettings::default(); // zoom = 1.0
+        let a = CameraSettings::default();
         let mut b = a.clone();
-        b.zoom = 1.005; // within 0.01
+        b.zoom = 1.005;
         assert!(!settings_changed(&a, &b));
         b.zoom = 1.02;
         assert!(settings_changed(&a, &b));
     }
 
-    // ── CameraSettings::build_args ────────────────────────────────────────────
-
     #[test]
-    fn build_args_auto_iso_omits_gain() {
-        let s = CameraSettings::default(); // iso_idx = 0 → "0"
-        let args = s.build_args();
+    fn build_rpicam_args_auto_iso_omits_gain() {
+        let s = CameraSettings::default();
+        let args = build_rpicam_args(&s);
         assert!(!args.contains(&"--gain".to_string()));
     }
 
     #[test]
-    fn build_args_iso_100_sets_gain_1() {
+    fn build_rpicam_args_iso_100_sets_gain_1() {
         let mut s = CameraSettings::default();
-        s.iso_idx = 1; // ISO_VALUES[1] = "100"
-        let args = s.build_args();
+        s.iso_idx = 1;
+        let args = build_rpicam_args(&s);
         let idx = args.iter().position(|a| a == "--gain").unwrap();
-        assert_eq!(args[idx + 1], "1"); // 100/100 = 1
+        assert_eq!(args[idx + 1], "1");
     }
 
     #[test]
-    fn build_args_auto_shutter_omits_flag() {
-        let s = CameraSettings::default(); // shutter_idx = 0 → 0µs
-        let args = s.build_args();
-        assert!(!args.contains(&"--shutter".to_string()));
-    }
-
-    #[test]
-    fn build_args_shutter_sets_microseconds() {
-        let mut s = CameraSettings::default();
-        s.shutter_idx = 1; // SHUTTER_SPEEDS[1] = ("1/4000", 250)
-        let args = s.build_args();
-        let idx = args.iter().position(|a| a == "--shutter").unwrap();
-        assert_eq!(args[idx + 1], "250");
-    }
-
-    #[test]
-    fn build_args_no_zoom_omits_roi() {
-        let s = CameraSettings::default(); // zoom = 1.0
-        let args = s.build_args();
-        assert!(!args.contains(&"--roi".to_string()));
-    }
-
-    #[test]
-    fn build_args_zoom_sets_roi() {
+    fn build_rpicam_args_zoom_sets_roi() {
         let mut s = CameraSettings::default();
         s.zoom = 2.0;
-        let args = s.build_args();
+        let args = build_rpicam_args(&s);
         assert!(args.contains(&"--roi".to_string()));
-        // w = h = 0.5, x = y = 0.25
         let idx = args.iter().position(|a| a == "--roi").unwrap();
         assert_eq!(args[idx + 1], "0.2500,0.2500,0.5000,0.5000");
     }
 
     #[test]
-    fn build_args_ev_zero_omits_flag() {
-        let s = CameraSettings::default(); // ev = 0.0
-        let args = s.build_args();
-        assert!(!args.contains(&"--ev".to_string()));
+    fn nv12_to_rgba_pure_black() {
+        // Y=16, U=128, V=128 → near-black
+        let w = 2u32; let h = 2u32;
+        let mut nv12 = vec![16u8; (w * h) as usize];      // Y plane
+        nv12.extend_from_slice(&[128u8, 128u8]);           // UV plane (one 2×2 block)
+        let rgba = nv12_to_rgba(&nv12, w, h);
+        assert_eq!(rgba.len(), (w * h * 4) as usize);
+        // alpha channel must be 255
+        assert!(rgba.iter().skip(3).step_by(4).all(|&a| a == 255));
     }
 
     #[test]
-    fn build_args_ev_nonzero_sets_flag() {
+    fn nv12_to_rgba_output_size() {
+        let w = 4u32; let h = 4u32;
+        let nv12 = vec![128u8; (w * h + w * h / 2) as usize];
+        let rgba = nv12_to_rgba(&nv12, w, h);
+        assert_eq!(rgba.len(), (w * h * 4) as usize);
+    }
+
+    #[test]
+    fn nv12_to_rgba_alpha_always_255() {
+        let w = 8u32; let h = 8u32;
+        let nv12 = vec![200u8; (w * h + w * h / 2) as usize];
+        let rgba = nv12_to_rgba(&nv12, w, h);
+        assert!(rgba.iter().skip(3).step_by(4).all(|&a| a == 255));
+    }
+
+    #[test]
+    fn nv12_to_rgba_pure_white() {
+        // Y=235 (broadcast white), U=128, V=128 → near-white RGB
+        let w = 2u32; let h = 2u32;
+        let mut nv12 = vec![235u8; (w * h) as usize];
+        nv12.extend_from_slice(&[128u8, 128u8]);
+        let rgba = nv12_to_rgba(&nv12, w, h);
+        // All R, G, B channels should be > 200
+        for i in 0..(w * h) as usize {
+            assert!(rgba[i * 4]     > 200, "R too low");
+            assert!(rgba[i * 4 + 1] > 200, "G too low");
+            assert!(rgba[i * 4 + 2] > 200, "B too low");
+        }
+    }
+
+    #[test]
+    fn nv12_to_rgba_red_channel() {
+        // Y=81, U=90, V=240 → approximately red (255, 0, 0) in studio swing
+        let w = 2u32; let h = 2u32;
+        let mut nv12 = vec![81u8; (w * h) as usize];
+        nv12.extend_from_slice(&[90u8, 240u8]); // U=90, V=240
+        let rgba = nv12_to_rgba(&nv12, w, h);
+        // Red should be significantly higher than blue
+        assert!(rgba[0] > rgba[2], "red channel should dominate");
+    }
+
+    #[test]
+    fn build_rpicam_args_auto_shutter_omits_flag() {
+        let s = CameraSettings::default();
+        let args = build_rpicam_args(&s);
+        assert!(!args.contains(&"--shutter".to_string()));
+    }
+
+    #[test]
+    fn build_rpicam_args_shutter_sets_microseconds() {
+        let mut s = CameraSettings::default();
+        s.shutter_idx = 1; // SHUTTER_SPEEDS[1] = ("1/4000", 250)
+        let args = build_rpicam_args(&s);
+        let idx = args.iter().position(|a| a == "--shutter").unwrap();
+        assert_eq!(args[idx + 1], "250");
+    }
+
+    #[test]
+    fn build_rpicam_args_no_zoom_omits_roi() {
+        let s = CameraSettings::default();
+        let args = build_rpicam_args(&s);
+        assert!(!args.contains(&"--roi".to_string()));
+    }
+
+    #[test]
+    fn build_rpicam_args_ev_nonzero_sets_flag() {
         let mut s = CameraSettings::default();
         s.ev = 1.5;
-        let args = s.build_args();
+        let args = build_rpicam_args(&s);
         assert!(args.contains(&"--ev".to_string()));
+    }
+
+    #[test]
+    fn build_rpicam_args_ev_zero_omits_flag() {
+        let s = CameraSettings::default();
+        let args = build_rpicam_args(&s);
+        assert!(!args.contains(&"--ev".to_string()));
     }
 }

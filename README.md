@@ -17,13 +17,13 @@ A kiosk camera application for the Raspberry Pi 4, written in Rust. Provides a f
 
 ## Features
 
-- Live preview at 25 fps — MJPEG stream from `rpicam-vid`, decoded in Rust, displayed via Slint
-- Simultaneous preview while recording video — preview continues uninterrupted while frames are also written to disk
-- Photo capture at full 12MP (4056×3040)
-- H264 720p video recording (1280×720): frames written to a temp file while preview continues; ffmpeg transcodes to MP4 when recording stops
+- Live preview at 25 fps — NV12 frames delivered directly from libcamera, converted to RGBA in Rust, no MJPEG round-trip
+- Simultaneous preview and 1080p video recording via dual libcamera streams (lores 800×480 for preview, main 1920×1080 for recording)
+- Video recorded as H264 MP4 — NV12 frames piped in real-time to ffmpeg, file is ready immediately when recording stops
+- Photo capture at full 12MP (4056×3040) via `rpicam-still`
 - Timelapse with configurable interval and duration; ffmpeg renders JPEG frames to MP4
 - Gallery: browse and delete photos and videos
-- Camera controls: ISO, Shutter Speed, AWB Mode, EV, Contrast, Saturation, Sharpness, Brightness, Zoom (1×–4× via `--roi`)
+- Camera controls: ISO, Shutter Speed, AWB Mode, EV, Contrast, Saturation, Sharpness, Brightness, Zoom (1×–4× via ScalerCrop)
 - Power menu: Shutdown, Reboot, Restart App
 - True kiosk: `cage` compositor, getty autologin, `~/.bash_profile` cage launch loop — no desktop required
 
@@ -35,6 +35,7 @@ Install system dependencies on the Pi:
 
 ```bash
 sudo apt install -y \
+    libcamera-dev \
     rpicam-apps \
     ffmpeg \
     cage \
@@ -55,7 +56,8 @@ Versions used in development:
 |----------------|---------|
 | Rust (stable) | 1.95 |
 | Slint | 1.16 |
-| rpicam-apps | system package |
+| libcamera | 0.7.1 |
+| rpicam-apps | system package (for photo capture) |
 | ffmpeg | system package |
 | cage | 0.2 |
 
@@ -69,7 +71,7 @@ cd ~/picam-rs
 cargo build --release
 ```
 
-> **Note:** The first build downloads and compiles all Rust and Slint dependencies. On a Pi 4 (2GB), expect roughly **25 minutes**. Incremental builds are fast.
+> **Note:** The first build compiles the C++ libcamera wrapper (`src/camera_ffi.cpp` via the `cc` crate) plus all Rust and Slint dependencies. On a Pi 4 (2GB), expect roughly **25 minutes**. Incremental builds are fast.
 
 The release binary is placed at `target/release/picam`.
 
@@ -120,20 +122,48 @@ On next boot, `getty` logs in `pi` automatically, `~/.bash_profile` launches `ca
 
 ---
 
-## How Video Recording Works
+## How It Works
 
-The live preview subprocess (`rpicam-vid --codec mjpeg -o -`) produces a continuous MJPEG byte stream. The Rust camera thread parses JPEG frame boundaries (`FF D8` ... `FF D9`) and for each complete frame:
+### Preview
 
-1. **Save to file** — if recording is active, the raw JPEG bytes are appended to a temp `.mjpeg` file
-2. **Decode for display** — the `image` crate decodes the JPEG to RGBA8, which is sent to the Slint event loop as a `SharedPixelBuffer`
+libcamera opens two concurrent streams when the app starts:
 
-When recording stops, ffmpeg transcodes the temp file:
+- **lores** (800×480, NV12) — delivered to the Rust preview callback at 25 fps
+- **main** (1920×1080, NV12) — delivered to the Rust record callback only when recording is active
+
+The C++ wrapper (`src/camera_ffi.cpp`) handles libcamera initialisation, buffer allocation, request queuing, and completion callbacks. The Rust layer converts NV12 frames to RGBA8 and sends them to the Slint event loop via a bounded channel.
+
+### Video Recording
+
+When recording starts, an ffmpeg child process is spawned with a raw NV12 pipe as input:
 
 ```
-ffmpeg -y -framerate 25 -f mjpeg -i temp.mjpeg -c:v libx264 -preset fast -pix_fmt yuv420p output.mp4
+ffmpeg -f rawvideo -pix_fmt nv12 -s 1920x1080 -r 25 -i pipe:0 -c:v libx264 -preset fast output.mp4
 ```
 
-The preview never pauses during recording. Still photo capture uses `rpicam-still` (separate process), which requires briefly pausing the preview subprocess (~600ms) to release the camera resource.
+Each main-stream frame is written directly to the pipe. The preview continues uninterrupted. When recording stops, the pipe is closed and ffmpeg finalises the MP4 immediately — no post-processing step.
+
+### Photo Capture
+
+Still photos use `rpicam-still` for full 12MP resolution (4056×3040). The libcamera preview streams are briefly paused (~200ms) to release the camera resource, `rpicam-still` runs, then streaming resumes.
+
+### Camera Settings
+
+Settings are applied as libcamera controls on the next queued request (no subprocess restart needed):
+
+| Setting | libcamera control | Range |
+|---------|------------------|-------|
+| ISO | `AnalogueGain` (gain = ISO/100) | Auto, 100–3200 |
+| Shutter speed | `ExposureTime` (microseconds) | Auto, 1/4000s–1s |
+| White balance | `AwbMode` | auto, incandescent, tungsten, fluorescent, indoor, daylight, cloudy |
+| Exposure compensation | `ExposureValue` | −4.0 to +4.0 |
+| Contrast | `Contrast` | 0.0–2.0 |
+| Saturation | `Saturation` | 0.0–2.0 |
+| Sharpness | `Sharpness` | 0.0–2.0 |
+| Brightness | `Brightness` | −1.0 to +1.0 |
+| Zoom | `ScalerCrop` (sensor rectangle) | 1×–4× (centre crop) |
+
+Settings are read from the Slint UI and pushed to the camera every 500ms, applied without restarting the preview.
 
 ---
 
@@ -141,14 +171,16 @@ The preview never pauses during recording. Still photo capture uses `rpicam-stil
 
 ```
 picam-rs/
-├── build.rs                  # Slint compiler invocation
-├── Cargo.toml                # Dependencies: slint, image, crossbeam-channel, anyhow
+├── build.rs                  # Slint compiler + cc crate compiles camera_ffi.cpp
+├── Cargo.toml                # Dependencies: slint, crossbeam-channel, anyhow; build: slint-build, cc
 ├── Cargo.lock
 ├── README.md
 ├── .gitignore
 ├── src/
 │   ├── main.rs               # Slint event loop, UI callbacks, thread management
-│   ├── camera.rs             # MJPEG preview loop, tee recording, still capture
+│   ├── camera.rs             # Rust FFI bindings, NV12→RGBA, ffmpeg pipe recording
+│   ├── camera_ffi.h          # C header: PicamHandle API
+│   ├── camera_ffi.cpp        # C++ libcamera wrapper (dual-stream, controls, pause/resume)
 │   ├── gallery.rs            # File scanning and deletion
 │   └── timelapse.rs          # Timelapse scheduling + ffmpeg MP4 render
 ├── ui/
@@ -157,26 +189,6 @@ picam-rs/
     ├── install.sh            # Kiosk install helper script
     └── picam.service         # systemd unit file (alternative to bash_profile approach)
 ```
-
----
-
-## Camera Settings
-
-All settings are applied as CLI arguments to `rpicam-vid` and `rpicam-still`:
-
-| Setting | rpicam flag | Range |
-|---------|------------|-------|
-| ISO | `--gain` (gain = ISO/100) | Auto, 100–3200 |
-| Shutter speed | `--shutter` (microseconds) | Auto, 1/4000s–1s |
-| White balance | `--awb` | auto, incandescent, tungsten, fluorescent, indoor, daylight, cloudy |
-| Exposure compensation | `--ev` | −4.0 to +4.0 |
-| Contrast | `--contrast` | 0.0–2.0 |
-| Saturation | `--saturation` | 0.0–2.0 |
-| Sharpness | `--sharpness` | 0.0–2.0 |
-| Brightness | `--brightness` | −1.0 to +1.0 |
-| Zoom | `--roi x,y,w,h` | 1×–4× (center crop) |
-
-Settings are read from the Slint UI and pushed to the camera thread every 500ms. The preview subprocess is restarted when settings change.
 
 ---
 
@@ -200,7 +212,9 @@ SSH into the Pi:
 ssh -i ~/.ssh/id_rsa pi@rpi4-2GB
 ```
 
-`cargo build` (debug) works for iteration; run the binary directly in a Wayland session or under cage. UI changes to `ui/app.slint` require a recompile (Slint hot-reload is not used here), but incremental Rust builds are fast after the first build.
+`cargo build` (debug) works for iteration. The C++ wrapper is recompiled only when `src/camera_ffi.cpp` or `src/camera_ffi.h` changes. UI changes to `ui/app.slint` require a recompile but incremental builds are fast after the first build.
+
+Keep `camera_ffi.h` and `camera_ffi.cpp` in sync with the `extern "C"` block in `camera.rs` — any signature change on the C++ side must be reflected in the Rust FFI declarations and vice versa.
 
 To monitor the kiosk log:
 
