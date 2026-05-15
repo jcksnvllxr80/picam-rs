@@ -99,15 +99,15 @@ mod tests {
     }
 
     fn tempdir() -> std::path::PathBuf {
-        let p = std::path::PathBuf::from(format!("/tmp/picam_test_{}", timestamp()));
+        let p = std::path::PathBuf::from(format!("/tmp/picam_test_{}", timestamp_ns()));
         fs::create_dir_all(&p).unwrap();
         p
     }
 
-    fn timestamp() -> u128 {
+    fn timestamp_ns() -> u128 {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_millis()
+            .as_nanos()
     }
 }
