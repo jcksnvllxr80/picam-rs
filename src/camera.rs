@@ -188,6 +188,31 @@ unsafe extern "C" fn on_record_frame(
     }
 }
 
+// ── RGBA → JPEG encoder (for streaming) ───────────────────────────────────────
+
+fn encode_jpeg(rgba: &[u8], width: u32, height: u32) -> Option<Vec<u8>> {
+    use image::{codecs::jpeg::JpegEncoder, ExtendedColorType};
+    // image 0.25's JpegEncoder rejects Rgba8 (JPEG has no alpha). Strip the
+    // alpha channel into a contiguous Rgb8 buffer first.
+    let pixels = (width as usize) * (height as usize);
+    let mut rgb = Vec::with_capacity(pixels * 3);
+    for i in 0..pixels {
+        let p = i * 4;
+        rgb.push(rgba[p]);
+        rgb.push(rgba[p + 1]);
+        rgb.push(rgba[p + 2]);
+    }
+    let mut buf = Vec::with_capacity(64 * 1024);
+    let mut encoder = JpegEncoder::new_with_quality(&mut buf, 70);
+    match encoder.encode(&rgb, width, height, ExtendedColorType::Rgb8) {
+        Ok(()) => Some(buf),
+        Err(e) => {
+            eprintln!("[stream] JpegEncoder::encode error: {e}");
+            None
+        }
+    }
+}
+
 // ── NV12 → RGBA conversion ────────────────────────────────────────────────────
 
 fn nv12_to_rgba(nv12: &[u8], width: u32, height: u32) -> Vec<u8> {
@@ -231,6 +256,9 @@ pub struct Camera {
     // user preference. capture_photo() must NOT auto-resume if the user
     // disabled the stream.
     stream_enabled: Arc<AtomicBool>,
+    // Optional live stream sinks. Set/cleared by main.rs as the user toggles.
+    pub local_stream: Arc<Mutex<Option<Arc<crate::stream::LocalStream>>>>,
+    pub push_stream:  Arc<Mutex<Option<crate::stream::PushStream>>>,
     // keeps callback context alive for the lifetime of the camera
     _ctx:         Box<CallbackCtx>,
 }
@@ -256,12 +284,56 @@ impl Camera {
         let (frame_tx, frame_rx) = bounded::<CameraEvent>(2);
         let recording = Arc::new(Mutex::new(None::<RecordingState>));
 
+        let local_stream: Arc<Mutex<Option<Arc<crate::stream::LocalStream>>>>
+            = Arc::new(Mutex::new(None));
+        let push_stream:  Arc<Mutex<Option<crate::stream::PushStream>>>
+            = Arc::new(Mutex::new(None));
+
         // Conversion worker: takes raw NV12, produces RGBA8, ships to UI.
+        // If a stream sink is active, also encode/forward the frame.
+        let local_for_worker = Arc::clone(&local_stream);
+        let push_for_worker  = Arc::clone(&push_stream);
         thread::Builder::new()
             .name("nv12-rgba".into())
             .spawn(move || {
+                // Throttle JPEG encoding: ~15 fps is enough for streaming and
+                // saves CPU vs encoding the full 25 fps preview rate.
+                let mut last_jpeg_at = std::time::Instant::now();
+                let mut frame_count   = 0u64;
+                let mut publish_count = 0u64;
                 while let Ok(frame) = nv12_rx.recv() {
+                    frame_count += 1;
                     let rgba = nv12_to_rgba(&frame.data, frame.width, frame.height);
+
+                    // Local MJPEG stream — encode JPEG, publish to clients.
+                    let local = local_for_worker.lock().ok().and_then(|g| g.clone());
+                    if let Some(local) = local {
+                        if last_jpeg_at.elapsed() >= Duration::from_millis(66) {
+                            match encode_jpeg(&rgba, frame.width, frame.height) {
+                                Some(jpeg) => {
+                                    let size = jpeg.len();
+                                    local.publish(jpeg);
+                                    publish_count += 1;
+                                    if publish_count == 1 || publish_count % 100 == 0 {
+                                        eprintln!("[stream] published frame #{} ({} bytes, total frames seen {})",
+                                                  publish_count, size, frame_count);
+                                    }
+                                    last_jpeg_at = std::time::Instant::now();
+                                }
+                                None => eprintln!("[stream] JPEG encode FAILED"),
+                            }
+                        }
+                    } else if frame_count % 200 == 0 {
+                        eprintln!("[stream] worker: no local stream set (frames seen: {})", frame_count);
+                    }
+
+                    // Push stream — write raw NV12 to ffmpeg stdin.
+                    if let Ok(mut p) = push_for_worker.lock() {
+                        if let Some(ref mut push) = *p {
+                            push.write_frame(&frame.data);
+                        }
+                    }
+
                     let _ = frame_tx.try_send(CameraEvent::Frame {
                         rgba,
                         width:  frame.width,
@@ -298,6 +370,8 @@ impl Camera {
             recording,
             paused: Arc::new(AtomicBool::new(false)),
             stream_enabled: Arc::new(AtomicBool::new(true)),
+            local_stream,
+            push_stream,
             _ctx: ctx,
         }
     }
@@ -314,6 +388,31 @@ impl Camera {
 
     pub fn is_stream_enabled(&self) -> bool {
         self.stream_enabled.load(Ordering::Relaxed)
+    }
+
+    // ── Stream sinks (called from main.rs in response to UI toggles) ──────────
+
+    pub fn set_local_stream(&self, port: u16) -> Result<()> {
+        // Drop any existing server first so the port frees up.
+        *self.local_stream.lock().unwrap() = None;
+        let server = crate::stream::LocalStream::start(port)?;
+        *self.local_stream.lock().unwrap() = Some(Arc::new(server));
+        Ok(())
+    }
+
+    pub fn clear_local_stream(&self) {
+        *self.local_stream.lock().unwrap() = None;
+    }
+
+    pub fn set_push_stream(&self, url: &str, width: u32, height: u32) -> Result<()> {
+        *self.push_stream.lock().unwrap() = None;
+        let pusher = crate::stream::PushStream::start(url, width, height, 15)?;
+        *self.push_stream.lock().unwrap() = Some(pusher);
+        Ok(())
+    }
+
+    pub fn clear_push_stream(&self) {
+        *self.push_stream.lock().unwrap() = None;
     }
 
     pub fn update_settings(&self, s: CameraSettings) {
