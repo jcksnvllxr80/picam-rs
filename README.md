@@ -18,9 +18,9 @@ A kiosk camera application for the Raspberry Pi 4, written in Rust. Provides a f
 ## Features
 
 - Live preview at 25 fps — MJPEG stream from `rpicam-vid`, decoded in Rust, displayed via Slint
-- Simultaneous preview while recording video (in-process tee: same JPEG bytes written to file and decoded for display)
+- Simultaneous preview while recording video — preview continues uninterrupted while frames are also written to disk
 - Photo capture at full 12MP (4056×3040)
-- H264 720p video recording (1280×720): MJPEG frames teed to a temp file while preview continues; ffmpeg transcodes to MP4 when recording stops
+- H264 720p video recording (1280×720): frames written to a temp file while preview continues; ffmpeg transcodes to MP4 when recording stops
 - Timelapse with configurable interval and duration; ffmpeg renders JPEG frames to MP4
 - Gallery: browse and delete photos and videos
 - Camera controls: ISO, Shutter Speed, AWB Mode, EV, Contrast, Saturation, Sharpness, Brightness, Zoom (1×–4× via `--roi`)
@@ -124,7 +124,7 @@ On next boot, `getty` logs in `pi` automatically, `~/.bash_profile` launches `ca
 
 The live preview subprocess (`rpicam-vid --codec mjpeg -o -`) produces a continuous MJPEG byte stream. The Rust camera thread parses JPEG frame boundaries (`FF D8` ... `FF D9`) and for each complete frame:
 
-1. **Tee to file** — if recording is active, the raw JPEG bytes are appended to a temp `.mjpeg` file
+1. **Save to file** — if recording is active, the raw JPEG bytes are appended to a temp `.mjpeg` file
 2. **Decode for display** — the `image` crate decodes the JPEG to RGBA8, which is sent to the Slint event loop as a `SharedPixelBuffer`
 
 When recording stops, ffmpeg transcodes the temp file:
