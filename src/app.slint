@@ -1,0 +1,640 @@
+import { ScrollView } from "std-widgets.slint";
+
+export enum Page { Viewfinder, Settings, Gallery, Power }
+export enum CaptureMode { Photo, Video, Timelapse }
+export enum TlState { Idle, Running, Rendering }
+
+export struct GalleryItem {
+    path: string,
+    name: string,
+    is-video: bool,
+}
+
+// ── Shared colours ────────────────────────────────────────────────────────────
+global Theme {
+    out property <color> bg:       #111111;
+    out property <color> surface:  #2a2a2a;
+    out property <color> overlay:  rgba(0,0,0,0.60);
+    out property <color> accent:   #e53935;
+    out property <color> green:    #43a047;
+    out property <color> text:     #f0f0f0;
+    out property <color> dim:      #888888;
+    out property <length> touch:   48px;
+}
+
+// ── Small icon-text button used in nav bar ────────────────────────────────────
+component NavBtn inherits TouchArea {
+    in property <string> label;
+    in property <bool> active: false;
+
+    width: 80px;
+    height: 60px;
+
+    Rectangle {
+        background: active ? #333333 : transparent;
+        border-radius: 6px;
+        Text {
+            text: label;
+            color: active ? Theme.text : Theme.dim;
+            font-size: active ? 13px : 12px;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
+}
+
+// ── Generic flat button (dark surface) ───────────────────────────────────────
+component FlatBtn inherits TouchArea {
+    in property <string> label;
+    in property <bool> active: false;
+    in property <color> active-color: Theme.accent;
+    in property <length> btn-font-size: 14px;
+
+    width: 90px;
+    height: Theme.touch;
+
+    Rectangle {
+        border-radius: 6px;
+        background: active ? active-color : Theme.surface;
+        Text {
+            text: label;
+            color: Theme.text;
+            font-size: btn-font-size;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
+}
+
+// ── Labelled row for settings ─────────────────────────────────────────────────
+component SettingRow inherits Rectangle {
+    in property <string> label;
+    background: transparent;
+    height: 60px;
+
+    Text {
+        x: 10px;
+        y: 0;
+        height: parent.height;
+        text: label;
+        color: Theme.dim;
+        font-size: 13px;
+        vertical-alignment: center;
+    }
+
+    @children
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Main window
+// ─────────────────────────────────────────────────────────────────────────────
+export component AppWindow inherits Window {
+    title: "PiCam";
+    width: 800px;
+    height: 480px;
+    background: Theme.bg;
+    no-frame: true;
+
+    // ── Camera state ──────────────────────────────────────────────────────────
+    in property <image>  preview-frame;
+    in property <bool>   recording:     false;
+    in property <string> rec-duration:  "00:00";
+    in property <bool>   capturing:     false;
+
+    // ── Navigation ────────────────────────────────────────────────────────────
+    in-out property <Page>        current-page:   Page.Viewfinder;
+    in-out property <CaptureMode> capture-mode:   CaptureMode.Photo;
+
+    // ── Settings ──────────────────────────────────────────────────────────────
+    in-out property <int>   iso-idx:    0;
+    in-out property <int>   shutter-idx:0;
+    in-out property <int>   awb-idx:    0;
+    in-out property <float> ev:         0.0;
+    in-out property <float> contrast:   1.0;
+    in-out property <float> saturation: 1.0;
+    in-out property <float> sharpness:  1.0;
+    in-out property <float> brightness: 0.0;
+    in-out property <float> zoom:       1.0;
+
+    // ── Timelapse ─────────────────────────────────────────────────────────────
+    in-out property <TlState> tl-state:     TlState.Idle;
+    in-out property <int>     tl-interval:  10;   // seconds between frames
+    in-out property <int>     tl-duration:  60;   // total seconds
+    in property    <int>      tl-frames:    0;
+    in property    <string>   tl-status:    "";
+
+    // ── Gallery ───────────────────────────────────────────────────────────────
+    in property <[GalleryItem]> gallery-items: [];
+    in-out property <int>       gallery-sel:   -1;
+
+    // ── Callbacks ─────────────────────────────────────────────────────────────
+    callback capture-photo();
+    callback start-recording();
+    callback stop-recording();
+    callback start-timelapse();
+    callback stop-timelapse();
+    callback render-timelapse();
+    callback delete-item(int);
+    callback shutdown-system();
+    callback reboot-system();
+    callback restart-app();
+
+    // ── Pages ─────────────────────────────────────────────────────────────────
+
+    // ·· Viewfinder ··
+    if current-page == Page.Viewfinder: Rectangle {
+        x: 0; y: 0; width: 800px; height: 420px;
+        background: #000000;
+        clip: true;
+
+        // Live preview
+        Image {
+            x: 0; y: 0;
+            width: 800px; height: 420px;
+            source: root.preview-frame;
+            image-fit: contain;
+        }
+
+        // Recording badge
+        if root.recording: Rectangle {
+            x: 10px; y: 10px;
+            width: 100px; height: 30px;
+            background: Theme.accent;
+            border-radius: 4px;
+            Text {
+                text: "● REC " + root.rec-duration;
+                color: white;
+                font-size: 12px;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
+
+        // Timelapse badge
+        if root.tl-state == TlState.Running || root.tl-state == TlState.Rendering: Rectangle {
+            x: 10px; y: root.recording ? 50px : 10px;
+            width: 160px; height: 30px;
+            background: #f57c00;
+            border-radius: 4px;
+            Text {
+                text: root.tl-state == TlState.Rendering ? "Rendering…" : "TL " + root.tl-frames + " frames";
+                color: white;
+                font-size: 12px;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
+
+        // Capture flash
+        if root.capturing: Rectangle {
+            background: white;
+            opacity: 0.4;
+        }
+
+        // Mode selector (left column overlay)
+        Rectangle {
+            x: 0; y: 155px;
+            width: 80px; height: 110px;
+            background: Theme.overlay;
+            border-radius: 0px 6px 6px 0px;
+
+            VerticalLayout {
+                spacing: 4px;
+                padding: 4px;
+
+                FlatBtn {
+                    label: "Photo";
+                    active: root.capture-mode == CaptureMode.Photo;
+                    active-color: #1565c0;
+                    width: 72px;
+                    clicked => { root.capture-mode = CaptureMode.Photo; }
+                }
+                FlatBtn {
+                    label: "Video";
+                    active: root.capture-mode == CaptureMode.Video;
+                    active-color: Theme.accent;
+                    width: 72px;
+                    clicked => { root.capture-mode = CaptureMode.Video; }
+                }
+                FlatBtn {
+                    label: "T-Lapse";
+                    active: root.capture-mode == CaptureMode.Timelapse;
+                    active-color: #f57c00;
+                    width: 72px;
+                    clicked => { root.capture-mode = CaptureMode.Timelapse; }
+                }
+            }
+        }
+
+        // Capture button (right side overlay)
+        capture-ta := TouchArea {
+            x: 720px; y: 160px;
+            width: 80px; height: 100px;
+
+            Rectangle {
+                border-radius: 40px;
+                background: root.capture-mode == CaptureMode.Photo  ? white      :
+                            root.capture-mode == CaptureMode.Video  ? (root.recording ? Theme.accent : Theme.green) :
+                            (root.tl-state == TlState.Running ? #f57c00 : #fb8c00);
+                width: 70px; height: 70px;
+                x: 5px; y: 15px;
+
+                Text {
+                    visible: root.capture-mode == CaptureMode.Video;
+                    text: root.recording ? "■" : "●";
+                    color: white;
+                    font-size: 28px;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+                Text {
+                    visible: root.capture-mode == CaptureMode.Timelapse;
+                    text: root.tl-state == TlState.Running ? "■" : "▶";
+                    color: white;
+                    font-size: 22px;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+
+            clicked => {
+                if root.capture-mode == CaptureMode.Photo {
+                    root.capture-photo();
+                } else if root.capture-mode == CaptureMode.Video {
+                    if root.recording { root.stop-recording(); } else { root.start-recording(); }
+                } else {
+                    if root.tl-state == TlState.Running { root.stop-timelapse(); } else { root.start-timelapse(); }
+                }
+            }
+        }
+
+        // Timelapse render button (appears when TL idle with frames)
+        if root.capture-mode == CaptureMode.Timelapse && root.tl-state == TlState.Idle && root.tl-frames > 0: TouchArea {
+            x: 690px; y: 265px;
+            width: 110px; height: 40px;
+            Rectangle {
+                background: #6a1b9a;
+                border-radius: 6px;
+                Text {
+                    text: "Render MP4";
+                    color: white;
+                    font-size: 12px;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+            clicked => { root.render-timelapse(); }
+        }
+
+        // Timelapse config (interval / duration) - bottom overlay when TL mode idle
+        if root.capture-mode == CaptureMode.Timelapse && root.tl-state == TlState.Idle: Rectangle {
+            x: 85px; y: 360px;
+            width: 630px; height: 60px;
+            background: Theme.overlay;
+            border-radius: 6px;
+
+            HorizontalLayout {
+                spacing: 8px;
+                padding: 8px;
+
+                Text { text: "Interval:"; color: Theme.dim; font-size: 12px; vertical-alignment: center; }
+                TouchArea {
+                    width: 30px; height: 36px;
+                    Rectangle { background: Theme.surface; border-radius: 4px;
+                        Text { text: "-"; color: Theme.text; horizontal-alignment: center; vertical-alignment: center; } }
+                    clicked => { if root.tl-interval > 2 { root.tl-interval -= 2; } }
+                }
+                Text { text: root.tl-interval + "s"; color: Theme.text; font-size: 14px; vertical-alignment: center; width: 36px; }
+                TouchArea {
+                    width: 30px; height: 36px;
+                    Rectangle { background: Theme.surface; border-radius: 4px;
+                        Text { text: "+"; color: Theme.text; horizontal-alignment: center; vertical-alignment: center; } }
+                    clicked => { if root.tl-interval < 300 { root.tl-interval += 2; } }
+                }
+
+                Rectangle { width: 12px; }
+
+                Text { text: "Duration:"; color: Theme.dim; font-size: 12px; vertical-alignment: center; }
+                TouchArea {
+                    width: 30px; height: 36px;
+                    Rectangle { background: Theme.surface; border-radius: 4px;
+                        Text { text: "-"; color: Theme.text; horizontal-alignment: center; vertical-alignment: center; } }
+                    clicked => { if root.tl-duration > 10 { root.tl-duration -= 10; } }
+                }
+                Text { text: root.tl-duration + "s"; color: Theme.text; font-size: 14px; vertical-alignment: center; width: 44px; }
+                TouchArea {
+                    width: 30px; height: 36px;
+                    Rectangle { background: Theme.surface; border-radius: 4px;
+                        Text { text: "+"; color: Theme.text; horizontal-alignment: center; vertical-alignment: center; } }
+                    clicked => { if root.tl-duration < 3600 { root.tl-duration += 10; } }
+                }
+            }
+        }
+    }
+
+    // ·· Settings ··
+    if current-page == Page.Settings: Rectangle {
+        x: 0; y: 0; width: 800px; height: 420px;
+        background: Theme.bg;
+
+        Text {
+            x: 16px; y: 12px;
+            text: "Settings";
+            color: Theme.text;
+            font-size: 18px;
+            font-weight: 700;
+        }
+
+        ScrollView {
+            x: 0; y: 44px;
+            width: 800px; height: 376px;
+
+            VerticalLayout {
+                width: 780px;
+                spacing: 2px;
+                padding-left: 10px;
+                padding-right: 10px;
+
+                // ISO
+                SettingRow { label: "ISO";
+                    HorizontalLayout {
+                        x: 120px; spacing: 4px; padding: 4px;
+                        for lbl[i] in ["Auto","100","200","400","800","1600","3200"]: FlatBtn {
+                            label: lbl; active: root.iso-idx == i; width: 68px;
+                            active-color: #1565c0;
+                            clicked => { root.iso-idx = i; }
+                        }
+                    }
+                }
+
+                // Shutter
+                SettingRow { label: "Shutter";
+                    HorizontalLayout {
+                        x: 120px; spacing: 4px; padding: 4px;
+                        for lbl[i] in ["Auto","1/4000","1/1000","1/500","1/250","1/60","1/30","1s"]: FlatBtn {
+                            label: lbl; active: root.shutter-idx == i; width: 70px;
+                            active-color: #1565c0;
+                            clicked => { root.shutter-idx = i; }
+                        }
+                    }
+                }
+
+                // AWB
+                SettingRow { label: "AWB";
+                    HorizontalLayout {
+                        x: 120px; spacing: 4px; padding: 4px;
+                        for lbl[i] in ["Auto","Incan","Tungst","Fluor","Indoor","Day","Cloudy"]: FlatBtn {
+                            label: lbl; active: root.awb-idx == i; width: 72px;
+                            active-color: #1565c0;
+                            clicked => { root.awb-idx = i; }
+                        }
+                    }
+                }
+
+                // EV
+                SettingRow { label: "EV  " + root.ev;
+                    HorizontalLayout {
+                        x: 120px; spacing: 6px; padding: 4px;
+                        for v in [-2.0, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0]: FlatBtn {
+                            label: v >= 0 ? "+" + v : "" + v;
+                            active: abs(root.ev - v) < 0.01;
+                            active-color: #1565c0;
+                            width: 60px;
+                            clicked => { root.ev = v; }
+                        }
+                    }
+                }
+
+                // Zoom
+                SettingRow { label: "Zoom  " + root.zoom + "×";
+                    HorizontalLayout {
+                        x: 120px; spacing: 6px; padding: 4px;
+                        for v in [1.0, 1.5, 2.0, 3.0, 4.0]: FlatBtn {
+                            label: v + "×";
+                            active: abs(root.zoom - v) < 0.01;
+                            active-color: #1565c0;
+                            width: 64px;
+                            clicked => { root.zoom = v; }
+                        }
+                    }
+                }
+
+                // Contrast / Saturation / Sharpness / Brightness sliders
+                SettingRow { label: "Contrast  " + root.contrast;
+                    HorizontalLayout {
+                        x: 180px; spacing: 6px; padding: 4px;
+                        for v in [0.5, 0.75, 1.0, 1.25, 1.5, 2.0]: FlatBtn {
+                            label: "" + v; active: abs(root.contrast - v) < 0.01;
+                            active-color: #1565c0; width: 60px;
+                            clicked => { root.contrast = v; }
+                        }
+                    }
+                }
+
+                SettingRow { label: "Saturation  " + root.saturation;
+                    HorizontalLayout {
+                        x: 180px; spacing: 6px; padding: 4px;
+                        for v in [0.0, 0.5, 1.0, 1.5, 2.0]: FlatBtn {
+                            label: "" + v; active: abs(root.saturation - v) < 0.01;
+                            active-color: #1565c0; width: 70px;
+                            clicked => { root.saturation = v; }
+                        }
+                    }
+                }
+
+                SettingRow { label: "Sharpness  " + root.sharpness;
+                    HorizontalLayout {
+                        x: 180px; spacing: 6px; padding: 4px;
+                        for v in [0.0, 0.5, 1.0, 1.5, 2.0]: FlatBtn {
+                            label: "" + v; active: abs(root.sharpness - v) < 0.01;
+                            active-color: #1565c0; width: 70px;
+                            clicked => { root.sharpness = v; }
+                        }
+                    }
+                }
+
+                SettingRow { label: "Brightness  " + root.brightness;
+                    HorizontalLayout {
+                        x: 180px; spacing: 6px; padding: 4px;
+                        for v in [-0.5, -0.25, 0.0, 0.25, 0.5]: FlatBtn {
+                            label: v >= 0 ? "+" + v : "" + v;
+                            active: abs(root.brightness - v) < 0.01;
+                            active-color: #1565c0; width: 80px;
+                            clicked => { root.brightness = v; }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ·· Gallery ··
+    if current-page == Page.Gallery: Rectangle {
+        x: 0; y: 0; width: 800px; height: 420px;
+        background: Theme.bg;
+
+        Text {
+            x: 16px; y: 12px;
+            text: "Gallery (" + root.gallery-items.length + ")";
+            color: Theme.text; font-size: 18px; font-weight: 700;
+        }
+
+        if root.gallery-items.length == 0: Text {
+            x: 0; y: 0; width: 800px; height: 420px;
+            text: "No photos or videos yet";
+            color: Theme.dim; font-size: 16px;
+            horizontal-alignment: center; vertical-alignment: center;
+        }
+
+        // Fullscreen selected item view
+        if root.gallery-sel >= 0: Rectangle {
+            background: #000000;
+            Text {
+                text: root.gallery-items[root.gallery-sel].name;
+                color: Theme.text; font-size: 13px;
+                x: 10px; y: 10px;
+            }
+            TouchArea {
+                x: 700px; y: 5px; width: 90px; height: 40px;
+                Rectangle { background: Theme.accent; border-radius: 6px;
+                    Text { text: "Delete"; color: white; font-size: 13px;
+                           horizontal-alignment: center; vertical-alignment: center; } }
+                clicked => {
+                    root.delete-item(root.gallery-sel);
+                    root.gallery-sel = -1;
+                }
+            }
+            TouchArea {
+                x: 600px; y: 5px; width: 90px; height: 40px;
+                Rectangle { background: Theme.surface; border-radius: 6px;
+                    Text { text: "Back"; color: white; font-size: 13px;
+                           horizontal-alignment: center; vertical-alignment: center; } }
+                clicked => { root.gallery-sel = -1; }
+            }
+            Text {
+                x: 0; y: 150px; width: 800px; height: 200px;
+                text: root.gallery-items[root.gallery-sel].is-video ? "📹 Video file\n" + root.gallery-items[root.gallery-sel].name : "📷 Photo\n" + root.gallery-items[root.gallery-sel].name;
+                color: Theme.dim; font-size: 14px;
+                horizontal-alignment: center; vertical-alignment: center;
+            }
+        }
+
+        // Item list
+        if root.gallery-sel < 0: ScrollView {
+            x: 0; y: 44px; width: 800px; height: 376px;
+            VerticalLayout {
+                width: 780px;
+                spacing: 2px;
+                padding: 8px;
+                for item[i] in root.gallery-items: TouchArea {
+                    height: 52px;
+                    Rectangle {
+                        background: i == root.gallery-sel ? #333333 : Theme.surface;
+                        border-radius: 6px;
+                        HorizontalLayout {
+                            padding: 10px; spacing: 10px;
+                            Text {
+                                text: item.is-video ? "🎬" : "📷";
+                                font-size: 20px; vertical-alignment: center; width: 30px;
+                            }
+                            Text {
+                                text: item.name;
+                                color: Theme.text; font-size: 13px;
+                                vertical-alignment: center;
+                                horizontal-stretch: 1;
+                            }
+                        }
+                    }
+                    clicked => { root.gallery-sel = i; }
+                }
+            }
+        }
+    }
+
+    // ·· Power ··
+    if current-page == Page.Power: Rectangle {
+        x: 0; y: 0; width: 800px; height: 420px;
+        background: Theme.bg;
+
+        Text {
+            x: 16px; y: 12px;
+            text: "Power";
+            color: Theme.text; font-size: 18px; font-weight: 700;
+        }
+
+        VerticalLayout {
+            x: 240px; y: 100px;
+            width: 320px;
+            spacing: 16px;
+
+            TouchArea {
+                height: 60px;
+                Rectangle {
+                    background: Theme.accent; border-radius: 10px;
+                    Text { text: "⏻  Shut Down";
+                           color: white; font-size: 18px;
+                           horizontal-alignment: center; vertical-alignment: center; }
+                }
+                clicked => { root.shutdown-system(); }
+            }
+
+            TouchArea {
+                height: 60px;
+                Rectangle {
+                    background: #e65100; border-radius: 10px;
+                    Text { text: "↺  Reboot";
+                           color: white; font-size: 18px;
+                           horizontal-alignment: center; vertical-alignment: center; }
+                }
+                clicked => { root.reboot-system(); }
+            }
+
+            TouchArea {
+                height: 60px;
+                Rectangle {
+                    background: #1565c0; border-radius: 10px;
+                    Text { text: "⟳  Restart App";
+                           color: white; font-size: 18px;
+                           horizontal-alignment: center; vertical-alignment: center; }
+                }
+                clicked => { root.restart-app(); }
+            }
+        }
+    }
+
+    // ── Bottom navigation bar (always visible) ────────────────────────────────
+    Rectangle {
+        x: 0; y: 420px;
+        width: 800px; height: 60px;
+        background: #1e1e1e;
+
+        HorizontalLayout {
+            spacing: 0;
+            alignment: center;
+
+            NavBtn {
+                label: "📷\nCamera";
+                active: root.current-page == Page.Viewfinder;
+                clicked => { root.current-page = Page.Viewfinder; }
+            }
+            NavBtn {
+                label: "⚙\nSettings";
+                active: root.current-page == Page.Settings;
+                clicked => { root.current-page = Page.Settings; }
+            }
+            NavBtn {
+                label: "🖼\nGallery";
+                active: root.current-page == Page.Gallery;
+                clicked => {
+                    root.gallery-sel = -1;
+                    root.current-page = Page.Gallery;
+                }
+            }
+            NavBtn {
+                label: "⏻\nPower";
+                active: root.current-page == Page.Power;
+                clicked => { root.current-page = Page.Power; }
+            }
+        }
+    }
+}

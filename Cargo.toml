@@ -1,0 +1,22 @@
+[package]
+name = "picam"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "picam"
+path = "src/main.rs"
+
+[dependencies]
+slint = { version = "1", features = ["backend-winit-wayland"] }
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
+crossbeam-channel = "0.5"
+anyhow = "1"
+
+[build-dependencies]
+slint-build = "1"
+
+[profile.release]
+opt-level = 2
+lto = "thin"
+codegen-units = 4
