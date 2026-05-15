@@ -20,7 +20,7 @@ A kiosk camera application for the Raspberry Pi 4, written in Rust. Provides a f
 - Live preview at 25 fps — MJPEG stream from `rpicam-vid`, decoded in Rust, displayed via Slint
 - Simultaneous preview while recording video (in-process tee: same JPEG bytes written to file and decoded for display)
 - Photo capture at full 12MP (4056×3040)
-- H264 1080p video recording: MJPEG frames teed to a temp file while preview continues; ffmpeg transcodes to MP4 when recording stops
+- H264 720p video recording (1280×720): MJPEG frames teed to a temp file while preview continues; ffmpeg transcodes to MP4 when recording stops
 - Timelapse with configurable interval and duration; ffmpeg renders JPEG frames to MP4
 - Gallery: browse and delete photos and videos
 - Camera controls: ISO, Shutter Speed, AWB Mode, EV, Contrast, Saturation, Sharpness, Brightness, Zoom (1×–4× via `--roi`)
