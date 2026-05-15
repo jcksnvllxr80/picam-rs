@@ -8,7 +8,11 @@ use std::thread;
 
 use slint::{Model, ModelRc, SharedPixelBuffer, Rgba8Pixel, VecModel};
 
-use camera::{Camera, CameraEvent, CameraSettings, SAVE_DIR, VIDEO_DIR, TL_DIR};
+use camera::{
+    Camera, CameraEvent, CameraSettings,
+    SAVE_DIR, VIDEO_DIR, TL_DIR,
+    PHOTO_RESOLUTIONS, VIDEO_RESOLUTIONS, TL_RESOLUTIONS,
+};
 
 slint::include_modules!();
 
@@ -140,13 +144,16 @@ fn main() {
             let handle  = handle.clone();
             let refresh = refresh.clone();
 
-            // Read settings while on event-loop thread, then hand off to thread
-            let settings = handle.upgrade().map(|ui| read_settings(&ui));
-            if let Some(s) = settings { cam_ref.update_settings(s); }
+            // Read settings + resolution while on event-loop thread
+            let (settings, res_idx) = handle.upgrade()
+                .map(|ui| (read_settings(&ui), ui.get_photo_res_idx() as usize))
+                .unwrap_or_default();
+            cam_ref.update_settings(settings);
+            let (w, h, _) = PHOTO_RESOLUTIONS[res_idx.min(PHOTO_RESOLUTIONS.len() - 1)];
 
             thread::spawn(move || {
                 let _ = handle.upgrade_in_event_loop(|ui| ui.set_capturing(true));
-                let result = cam_ref.capture_photo();
+                let result = cam_ref.capture_photo(w, h);
                 thread::sleep(Duration::from_millis(150));
                 let _ = handle.upgrade_in_event_loop(|ui| ui.set_capturing(false));
                 if let Err(e) = result { eprintln!("[photo] {e:#}"); } else { refresh(); }
@@ -155,15 +162,17 @@ fn main() {
     }
 
     // ── Video recording start ─────────────────────────────────────────────────
-    // Recording now tees live MJPEG frames to a file — no subprocess to launch.
     {
         let cam_ref = Arc::clone(&cam);
         let handle  = handle.clone();
         app.on_start_recording(move || {
-            let settings = handle.upgrade().map(|ui| read_settings(&ui));
-            if let Some(s) = settings { cam_ref.update_settings(s); }
+            let (settings, res_idx) = handle.upgrade()
+                .map(|ui| (read_settings(&ui), ui.get_video_res_idx() as usize))
+                .unwrap_or_default();
+            cam_ref.update_settings(settings);
+            let (w, h, _) = VIDEO_RESOLUTIONS[res_idx.min(VIDEO_RESOLUTIONS.len() - 1)];
 
-            match cam_ref.start_recording() {
+            match cam_ref.start_recording(w, h) {
                 Ok(_)  => { let _ = handle.upgrade_in_event_loop(|ui| ui.set_recording(true)); }
                 Err(e) => eprintln!("[rec] start: {e:#}"),
             }
@@ -194,10 +203,14 @@ fn main() {
         let tl_ref  = Arc::clone(&tl);
         let handle  = handle.clone();
         app.on_start_timelapse(move || {
-            let interval = handle.upgrade().map(|ui| ui.get_tl_interval() as u64).unwrap_or(10);
-            let duration = handle.upgrade().map(|ui| ui.get_tl_duration() as u64).unwrap_or(60);
-            let settings = handle.upgrade().map(|ui| read_settings(&ui));
-            if let Some(s) = settings { cam_ref.update_settings(s); }
+            let (interval, duration, settings, res_idx) = handle.upgrade().map(|ui| (
+                ui.get_tl_interval() as u64,
+                ui.get_tl_duration() as u64,
+                read_settings(&ui),
+                ui.get_tl_res_idx() as usize,
+            )).unwrap_or_else(|| (10, 60, CameraSettings::default(), 0));
+            cam_ref.update_settings(settings);
+            let (w, h, _) = TL_RESOLUTIONS[res_idx.min(TL_RESOLUTIONS.len() - 1)];
 
             let _ = handle.upgrade_in_event_loop(|ui| ui.set_tl_state(TlState::Running));
 
@@ -208,6 +221,7 @@ fn main() {
                 Arc::clone(&cam_ref),
                 interval,
                 duration,
+                w, h,
                 move |n| {
                     let _ = handle_frame.upgrade_in_event_loop(move |ui| ui.set_tl_frames(n as i32));
                 },
@@ -258,6 +272,38 @@ fn main() {
                 }
             }
             refresh();
+        });
+    }
+
+    // ── Stream on/off toggle (Advanced setting) ───────────────────────────────
+    {
+        let cam_ref = Arc::clone(&cam);
+        app.on_toggle_stream(move |on| {
+            cam_ref.set_stream_enabled(on);
+        });
+    }
+
+    // ── Gallery item selected — load the image (or video thumbnail) ──────────
+    {
+        let handle = handle.clone();
+        app.on_select_gallery_item(move |idx| {
+            let Some(ui) = handle.upgrade() else { return };
+            let items = ui.get_gallery_items();
+            let Some(item) = items.row_data(idx as usize) else { return };
+
+            let path = item.path.to_string();
+            // For videos: load the thumbnail (<name>.thumb.jpg) if it exists.
+            let load_path = if item.is_video {
+                let p = std::path::PathBuf::from(&path);
+                p.with_extension("thumb.jpg")
+            } else {
+                std::path::PathBuf::from(&path)
+            };
+
+            match slint::Image::load_from_path(&load_path) {
+                Ok(img) => ui.set_gallery_preview_image(img),
+                Err(_)  => ui.set_gallery_preview_image(slint::Image::default()),
+            }
         });
     }
 

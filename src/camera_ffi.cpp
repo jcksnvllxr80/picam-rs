@@ -1,16 +1,18 @@
 #include "camera_ffi.h"
 
 #include <libcamera/libcamera.h>
-#include <libcamera/base/object.h>
 
 #include <sys/mman.h>
 #include <atomic>
 #include <condition_variable>
+#include <cstdio>
 #include <cstring>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <vector>
+
+#define PLOG(...) do { fprintf(stderr, "[picam-ffi] " __VA_ARGS__); fputc('\n', stderr); fflush(stderr); } while (0)
 
 using namespace libcamera;
 
@@ -35,7 +37,10 @@ static MappedBuf map_fb(const FrameBuffer *fb)
 
 // ── Internal camera context ────────────────────────────────────────────────────
 
-struct PicamHandle : public Object {
+// NOT a libcamera::Object — that would queue completion callbacks to this
+// object's thread, which has no event dispatcher. Plain struct means
+// requestCompleted fires directly on libcamera's completion thread.
+struct PicamHandle {
     // libcamera objects
     std::shared_ptr<CameraManager>       manager;
     std::shared_ptr<Camera>              camera;
@@ -250,13 +255,24 @@ PicamHandle *picam_open(uint32_t preview_w, uint32_t preview_h,
         cam->requests.push_back(std::move(req));
     }
 
+    PLOG("picam_open: configured, %d requests built, mmapped %d buffers", n, (int)cam->buf_map.size());
+
     // Connect completion signal
     cam->camera->requestCompleted.connect(cam.get(), &PicamHandle::on_request_complete);
+    PLOG("picam_open: signal connected");
 
     // Start streaming
-    cam->camera->start();
-    for (auto &req : cam->requests)
-        cam->camera->queueRequest(req.get());
+    int start_ret = cam->camera->start();
+    PLOG("picam_open: camera->start() returned %d", start_ret);
+    if (start_ret < 0) return nullptr;
+
+    int queued = 0;
+    for (auto &req : cam->requests) {
+        int q = cam->camera->queueRequest(req.get());
+        if (q == 0) queued++;
+        else PLOG("queueRequest failed: %d", q);
+    }
+    PLOG("picam_open: queued %d/%d requests, streaming=true", queued, (int)cam->requests.size());
     cam->streaming.store(true);
 
     return cam.release();
@@ -279,14 +295,63 @@ void picam_close(PicamHandle *cam)
     delete cam;
 }
 
+// Pause fully tears down so rpicam-still can grab the camera. Stopping the
+// streams alone leaves libcamera holding the pipeline handler. Resume
+// rebuilds buffers + requests because rpicam-still may have reconfigured the
+// camera while we weren't looking, invalidating the previous pointers.
 void picam_pause(PicamHandle *cam)
 {
-    if (cam) cam->stop_streams();
+    if (!cam) return;
+    cam->stop_streams();
+    for (auto &[fb, mb] : cam->buf_map)
+        if (mb.ptr) ::munmap(mb.ptr, mb.size);
+    cam->buf_map.clear();
+    cam->requests.clear();
+    cam->allocator.reset();
+    cam->camera->release();
+    PLOG("picam_pause: camera released");
 }
 
 void picam_resume(PicamHandle *cam)
 {
-    if (cam) cam->start_streams();
+    if (!cam) return;
+    if (cam->camera->acquire() < 0) {
+        PLOG("picam_resume: camera->acquire() failed");
+        return;
+    }
+    if (cam->camera->configure(cam->config.get()) < 0) {
+        PLOG("picam_resume: configure failed");
+        return;
+    }
+    cam->allocator = std::make_unique<FrameBufferAllocator>(cam->camera);
+    for (auto &cfg : *cam->config) {
+        if (cam->allocator->allocate(cfg.stream()) < 0) {
+            PLOG("picam_resume: allocate failed");
+            return;
+        }
+    }
+    constexpr int N_BUFS = 4;
+    const auto &preview_bufs = cam->allocator->buffers(cam->preview_stream);
+    const auto &record_bufs  = cam->allocator->buffers(cam->record_stream);
+    int n = std::min({ N_BUFS,
+                       static_cast<int>(preview_bufs.size()),
+                       static_cast<int>(record_bufs.size()) });
+    for (int i = 0; i < n; i++) {
+        auto req = cam->camera->createRequest();
+        if (!req) return;
+        FrameBuffer *pb = preview_bufs[i].get();
+        FrameBuffer *rb = record_bufs[i].get();
+        if (req->addBuffer(cam->preview_stream, pb) < 0) return;
+        if (req->addBuffer(cam->record_stream,  rb) < 0) return;
+        cam->buf_map[pb] = map_fb(pb);
+        cam->buf_map[rb] = map_fb(rb);
+        cam->requests.push_back(std::move(req));
+    }
+    cam->camera->start();
+    for (auto &req : cam->requests)
+        cam->camera->queueRequest(req.get());
+    cam->streaming.store(true);
+    PLOG("picam_resume: rebuilt %d requests, streaming", n);
 }
 
 // ── Settings ──────────────────────────────────────────────────────────────────

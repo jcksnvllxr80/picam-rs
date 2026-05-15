@@ -31,6 +31,8 @@ impl Timelapse {
         camera: Arc<Camera>,
         interval_secs: u64,
         duration_secs: u64,
+        frame_width:   u32,
+        frame_height:  u32,
         on_frame: impl Fn(usize) + Send + 'static,
         on_done:  impl Fn() + Send + 'static,
     ) {
@@ -53,7 +55,7 @@ impl Timelapse {
                 let total_frames = (duration_secs / interval_secs.max(1)) as usize;
                 for i in 0..total_frames {
                     if !running.load(Ordering::Relaxed) { break; }
-                    if let Ok(path) = camera.capture_timelapse_frame(i, &dir) {
+                    if let Ok(path) = camera.capture_timelapse_frame(i, &dir, frame_width, frame_height) {
                         if path.exists() {
                             *frame_count.lock().unwrap() = i + 1;
                             on_frame(i + 1);

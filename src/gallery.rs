@@ -19,6 +19,11 @@ pub fn scan(dirs: &[&str]) -> Vec<GalleryItem> {
             .collect();
         paths.sort_by(|a, b| b.cmp(a)); // newest first
         for p in paths {
+            let name = p.file_name().unwrap().to_string_lossy().into_owned();
+            // Skip video thumbnails (VID_*.thumb.jpg) — they back the gallery preview
+            // and shouldn't show as separate items.
+            if name.ends_with(".thumb.jpg") { continue; }
+
             let ext = p.extension()
                 .and_then(|e| e.to_str())
                 .unwrap_or("")
@@ -27,8 +32,8 @@ pub fn scan(dirs: &[&str]) -> Vec<GalleryItem> {
             let is_photo = matches!(ext.as_str(), "jpg" | "jpeg" | "png" | "dng");
             if is_video || is_photo {
                 items.push(GalleryItem {
-                    path:     p.to_string_lossy().into_owned(),
-                    name:     p.file_name().unwrap().to_string_lossy().into_owned(),
+                    path: p.to_string_lossy().into_owned(),
+                    name,
                     is_video,
                 });
             }
@@ -38,11 +43,17 @@ pub fn scan(dirs: &[&str]) -> Vec<GalleryItem> {
 }
 
 pub fn delete(path: &str) -> bool {
-    if Path::new(path).exists() {
-        fs::remove_file(path).is_ok()
-    } else {
-        false
+    if !Path::new(path).exists() {
+        return false;
     }
+    // Also remove any sidecar thumbnail (e.g. VID_*.thumb.jpg) so the gallery
+    // stays consistent.
+    let p = Path::new(path);
+    let thumb = p.with_extension("thumb.jpg");
+    if thumb.exists() {
+        let _ = fs::remove_file(&thumb);
+    }
+    fs::remove_file(path).is_ok()
 }
 
 #[cfg(test)]

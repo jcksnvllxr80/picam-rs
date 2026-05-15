@@ -3,6 +3,7 @@ import { ScrollView } from "std-widgets.slint";
 export enum Page { Viewfinder, Settings, Gallery, Power }
 export enum CaptureMode { Photo, Video, Timelapse }
 export enum TlState { Idle, Running, Rendering }
+export enum SettingsTab { Capture, Image, Advanced }
 
 export struct GalleryItem {
     path: string,
@@ -11,14 +12,19 @@ export struct GalleryItem {
 }
 
 // ── Shared colours ────────────────────────────────────────────────────────────
+// Astro theme: monochrome red palette tuned for telescope eyepiece use.
+// Red light (>600nm) minimally activates rod cells, so the UI never wrecks
+// dark adaptation. Hierarchy comes from brightness, not hue. Never use
+// white, blue, or green anywhere — all of those destroy night vision.
 global Theme {
-    out property <color> bg:       #111111;
-    out property <color> surface:  #2a2a2a;
-    out property <color> overlay:  rgba(0,0,0,0.60);
-    out property <color> accent:   #e53935;
-    out property <color> green:    #43a047;
-    out property <color> text:     #f0f0f0;
-    out property <color> dim:      #888888;
+    out property <color> bg:       #000000;             // pure black, no stray light
+    out property <color> surface:  #1a0606;             // very dim red-tinted button bg
+    out property <color> overlay:  rgba(20,0,0,0.75);   // red-tinted overlays
+    out property <color> accent:   #ff3030;             // bright red (record / destructive)
+    out property <color> warn:     #c04020;             // dimmer red (warnings, timelapse)
+    out property <color> info:     #802020;             // dim red (selected / info state)
+    out property <color> text:     #d04040;             // readable dim red
+    out property <color> dim:      #803030;             // hint-level red
     out property <length> touch:   48px;
 }
 
@@ -77,8 +83,8 @@ component SettingRow inherits Rectangle {
         y: 0;
         height: parent.height;
         text: label;
-        color: Theme.dim;
-        font-size: 13px;
+        color: Theme.text;
+        font-size: 14px;
         vertical-alignment: center;
     }
 
@@ -126,6 +132,14 @@ export component AppWindow inherits Window {
     // ── Gallery ───────────────────────────────────────────────────────────────
     in property <[GalleryItem]> gallery-items: [];
     in-out property <int>       gallery-sel:   -1;
+    in property    <image>      gallery-preview-image;
+
+    // ── Advanced ──────────────────────────────────────────────────────────────
+    in-out property <bool>        stream-enabled: true;
+    in-out property <int>         photo-res-idx:  0;   // 0=12MP .. 3=FHD
+    in-out property <int>         video-res-idx:  0;   // 0=1080p .. 2=480p
+    in-out property <int>         tl-res-idx:     0;   // 0=3MP .. 2=720p
+    in-out property <SettingsTab> settings-tab:   SettingsTab.Capture;
 
     // ── Callbacks ─────────────────────────────────────────────────────────────
     callback capture-photo();
@@ -135,6 +149,8 @@ export component AppWindow inherits Window {
     callback stop-timelapse();
     callback render-timelapse();
     callback delete-item(int);
+    callback select-gallery-item(int);
+    callback toggle-stream(bool);
     callback shutdown-system();
     callback reboot-system();
     callback restart-app();
@@ -155,16 +171,36 @@ export component AppWindow inherits Window {
             image-fit: contain;
         }
 
+        // "Preview Disabled" overlay (covers the dark preview area)
+        if !root.stream-enabled: Rectangle {
+            x: 0; y: 0; width: 800px; height: 420px;
+            background: Theme.bg;
+            VerticalLayout {
+                alignment: center; spacing: 12px;
+                Text {
+                    text: "● Preview Disabled";
+                    color: Theme.text; font-size: 22px; font-weight: 700;
+                    horizontal-alignment: center;
+                }
+                Text {
+                    text: "Re-enable in Settings → Advanced → Live Preview";
+                    color: Theme.dim; font-size: 13px;
+                    horizontal-alignment: center;
+                }
+            }
+        }
+
         // Recording badge
         if root.recording: Rectangle {
             x: 10px; y: 10px;
-            width: 100px; height: 30px;
+            width: 110px; height: 32px;
             background: Theme.accent;
             border-radius: 4px;
             Text {
                 text: "● REC " + root.rec-duration;
-                color: white;
-                font-size: 12px;
+                color: Theme.text;
+                font-size: 13px;
+                font-weight: 700;
                 horizontal-alignment: center;
                 vertical-alignment: center;
             }
@@ -173,22 +209,22 @@ export component AppWindow inherits Window {
         // Timelapse badge
         if root.tl-state == TlState.Running || root.tl-state == TlState.Rendering: Rectangle {
             x: 10px; y: root.recording ? 50px : 10px;
-            width: 160px; height: 30px;
-            background: #f57c00;
+            width: 160px; height: 32px;
+            background: Theme.warn;
             border-radius: 4px;
             Text {
                 text: root.tl-state == TlState.Rendering ? "Rendering…" : "TL " + root.tl-frames + " frames";
-                color: white;
-                font-size: 12px;
+                color: Theme.text;
+                font-size: 13px;
                 horizontal-alignment: center;
                 vertical-alignment: center;
             }
         }
 
-        // Capture flash
+        // Capture flash — DIM RED, not white. White destroys dark adaptation.
         if root.capturing: Rectangle {
-            background: white;
-            opacity: 0.4;
+            background: #2a0000;
+            opacity: 0.5;
         }
 
         // Mode selector (left column overlay)
@@ -205,21 +241,21 @@ export component AppWindow inherits Window {
                 FlatBtn {
                     label: "Photo";
                     active: root.capture-mode == CaptureMode.Photo;
-                    active-color: #1565c0;
+                    active-color: Theme.info;
                     width: 72px;
                     clicked => { root.capture-mode = CaptureMode.Photo; }
                 }
                 FlatBtn {
                     label: "Video";
                     active: root.capture-mode == CaptureMode.Video;
-                    active-color: Theme.accent;
+                    active-color: Theme.info;
                     width: 72px;
                     clicked => { root.capture-mode = CaptureMode.Video; }
                 }
                 FlatBtn {
                     label: "T-Lapse";
                     active: root.capture-mode == CaptureMode.Timelapse;
-                    active-color: #f57c00;
+                    active-color: Theme.info;
                     width: 72px;
                     clicked => { root.capture-mode = CaptureMode.Timelapse; }
                 }
@@ -227,22 +263,27 @@ export component AppWindow inherits Window {
         }
 
         // Capture button (right side overlay)
+        // Recording (active) is bright red; idle states are dim red — brightness
+        // signals state, so cold fingers can read it at a glance.
         capture-ta := TouchArea {
-            x: 720px; y: 160px;
-            width: 80px; height: 100px;
+            x: 708px; y: 160px;
+            width: 84px; height: 100px;
 
             Rectangle {
-                border-radius: 40px;
-                background: root.capture-mode == CaptureMode.Photo  ? white      :
-                            root.capture-mode == CaptureMode.Video  ? (root.recording ? Theme.accent : Theme.green) :
-                            (root.tl-state == TlState.Running ? #f57c00 : #fb8c00);
-                width: 70px; height: 70px;
-                x: 5px; y: 15px;
+                border-radius: 42px;
+                background: capture-ta.pressed ? Theme.accent :
+                            root.capture-mode == CaptureMode.Video    ? (root.recording ? Theme.accent : Theme.info) :
+                            root.capture-mode == CaptureMode.Timelapse ? (root.tl-state == TlState.Running ? Theme.accent : Theme.warn) :
+                            Theme.info;
+                width: 76px; height: 76px;
+                x: 4px; y: 12px;
+                border-width: 2px;
+                border-color: Theme.text;
 
                 Text {
                     visible: root.capture-mode == CaptureMode.Video;
                     text: root.recording ? "■" : "●";
-                    color: white;
+                    color: Theme.text;
                     font-size: 28px;
                     horizontal-alignment: center;
                     vertical-alignment: center;
@@ -250,7 +291,7 @@ export component AppWindow inherits Window {
                 Text {
                     visible: root.capture-mode == CaptureMode.Timelapse;
                     text: root.tl-state == TlState.Running ? "■" : "▶";
-                    color: white;
+                    color: Theme.text;
                     font-size: 22px;
                     horizontal-alignment: center;
                     vertical-alignment: center;
@@ -270,15 +311,15 @@ export component AppWindow inherits Window {
 
         // Timelapse render button (appears when TL idle with frames)
         if root.capture-mode == CaptureMode.Timelapse && root.tl-state == TlState.Idle && root.tl-frames > 0: TouchArea {
-            x: 690px; y: 265px;
-            width: 110px; height: 40px;
+            x: 688px; y: 270px;
+            width: 104px; height: 48px;
             Rectangle {
-                background: #6a1b9a;
+                background: Theme.warn;
                 border-radius: 6px;
                 Text {
                     text: "Render MP4";
-                    color: white;
-                    font-size: 12px;
+                    color: Theme.text;
+                    font-size: 13px;
                     horizontal-alignment: center;
                     vertical-alignment: center;
                 }
@@ -287,46 +328,90 @@ export component AppWindow inherits Window {
         }
 
         // Timelapse config (interval / duration) - bottom overlay when TL mode idle
+        // Logarithmic-ish steps tuned for astro: short intervals for planetary
+        // capture, hour-scale durations for deep-sky sessions.
         if root.capture-mode == CaptureMode.Timelapse && root.tl-state == TlState.Idle: Rectangle {
-            x: 85px; y: 360px;
-            width: 630px; height: 60px;
+            x: 85px; y: 354px;
+            width: 615px; height: 60px;
             background: Theme.overlay;
             border-radius: 6px;
 
             HorizontalLayout {
-                spacing: 8px;
-                padding: 8px;
+                spacing: 6px;
+                padding: 6px;
 
-                Text { text: "Interval:"; color: Theme.dim; font-size: 12px; vertical-alignment: center; }
+                Text { text: "Int:"; color: Theme.dim; font-size: 13px; vertical-alignment: center; }
                 TouchArea {
-                    width: 30px; height: 36px;
-                    Rectangle { background: Theme.surface; border-radius: 4px;
-                        Text { text: "-"; color: Theme.text; horizontal-alignment: center; vertical-alignment: center; } }
-                    clicked => { if root.tl-interval > 2 { root.tl-interval -= 2; } }
+                    width: 48px; height: 48px;
+                    Rectangle { background: Theme.surface; border-radius: 6px;
+                        Text { text: "−"; color: Theme.text; font-size: 20px;
+                               horizontal-alignment: center; vertical-alignment: center; } }
+                    clicked => {
+                        if      root.tl-interval > 60 { root.tl-interval = 60;  }
+                        else if root.tl-interval > 30 { root.tl-interval = 30;  }
+                        else if root.tl-interval > 10 { root.tl-interval = 10;  }
+                        else if root.tl-interval > 5  { root.tl-interval = 5;   }
+                        else if root.tl-interval > 2  { root.tl-interval = 2;   }
+                        else if root.tl-interval > 1  { root.tl-interval = 1;   }
+                    }
                 }
-                Text { text: root.tl-interval + "s"; color: Theme.text; font-size: 14px; vertical-alignment: center; width: 36px; }
+                Text { text: root.tl-interval + "s"; color: Theme.text; font-size: 14px;
+                       vertical-alignment: center; width: 44px; horizontal-alignment: center; }
                 TouchArea {
-                    width: 30px; height: 36px;
-                    Rectangle { background: Theme.surface; border-radius: 4px;
-                        Text { text: "+"; color: Theme.text; horizontal-alignment: center; vertical-alignment: center; } }
-                    clicked => { if root.tl-interval < 300 { root.tl-interval += 2; } }
+                    width: 48px; height: 48px;
+                    Rectangle { background: Theme.surface; border-radius: 6px;
+                        Text { text: "+"; color: Theme.text; font-size: 20px;
+                               horizontal-alignment: center; vertical-alignment: center; } }
+                    clicked => {
+                        if      root.tl-interval < 1   { root.tl-interval = 1;   }
+                        else if root.tl-interval < 2   { root.tl-interval = 2;   }
+                        else if root.tl-interval < 5   { root.tl-interval = 5;   }
+                        else if root.tl-interval < 10  { root.tl-interval = 10;  }
+                        else if root.tl-interval < 30  { root.tl-interval = 30;  }
+                        else if root.tl-interval < 60  { root.tl-interval = 60;  }
+                        else if root.tl-interval < 120 { root.tl-interval = 120; }
+                        else if root.tl-interval < 300 { root.tl-interval = 300; }
+                    }
                 }
 
                 Rectangle { width: 12px; }
 
-                Text { text: "Duration:"; color: Theme.dim; font-size: 12px; vertical-alignment: center; }
+                Text { text: "Dur:"; color: Theme.dim; font-size: 13px; vertical-alignment: center; }
                 TouchArea {
-                    width: 30px; height: 36px;
-                    Rectangle { background: Theme.surface; border-radius: 4px;
-                        Text { text: "-"; color: Theme.text; horizontal-alignment: center; vertical-alignment: center; } }
-                    clicked => { if root.tl-duration > 10 { root.tl-duration -= 10; } }
+                    width: 48px; height: 48px;
+                    Rectangle { background: Theme.surface; border-radius: 6px;
+                        Text { text: "−"; color: Theme.text; font-size: 20px;
+                               horizontal-alignment: center; vertical-alignment: center; } }
+                    clicked => {
+                        if      root.tl-duration > 3600 { root.tl-duration = 3600; }
+                        else if root.tl-duration > 1800 { root.tl-duration = 1800; }
+                        else if root.tl-duration > 600  { root.tl-duration = 600;  }
+                        else if root.tl-duration > 300  { root.tl-duration = 300;  }
+                        else if root.tl-duration > 60   { root.tl-duration = 60;   }
+                        else if root.tl-duration > 30   { root.tl-duration = 30;   }
+                    }
                 }
-                Text { text: root.tl-duration + "s"; color: Theme.text; font-size: 14px; vertical-alignment: center; width: 44px; }
+                Text {
+                    text: root.tl-duration >= 3600 ? (root.tl-duration / 3600) + "h" :
+                          root.tl-duration >= 60   ? (root.tl-duration / 60) + "m" :
+                                                     root.tl-duration + "s";
+                    color: Theme.text; font-size: 14px;
+                    vertical-alignment: center; width: 56px; horizontal-alignment: center;
+                }
                 TouchArea {
-                    width: 30px; height: 36px;
-                    Rectangle { background: Theme.surface; border-radius: 4px;
-                        Text { text: "+"; color: Theme.text; horizontal-alignment: center; vertical-alignment: center; } }
-                    clicked => { if root.tl-duration < 3600 { root.tl-duration += 10; } }
+                    width: 48px; height: 48px;
+                    Rectangle { background: Theme.surface; border-radius: 6px;
+                        Text { text: "+"; color: Theme.text; font-size: 20px;
+                               horizontal-alignment: center; vertical-alignment: center; } }
+                    clicked => {
+                        if      root.tl-duration < 30   { root.tl-duration = 30;   }
+                        else if root.tl-duration < 60   { root.tl-duration = 60;   }
+                        else if root.tl-duration < 300  { root.tl-duration = 300;  }
+                        else if root.tl-duration < 600  { root.tl-duration = 600;  }
+                        else if root.tl-duration < 1800 { root.tl-duration = 1800; }
+                        else if root.tl-duration < 3600 { root.tl-duration = 3600; }
+                        else if root.tl-duration < 7200 { root.tl-duration = 7200; }
+                    }
                 }
             }
         }
@@ -337,23 +422,69 @@ export component AppWindow inherits Window {
         x: 0; y: 0; width: 800px; height: 420px;
         background: Theme.bg;
 
-        Text {
-            x: 16px; y: 12px;
-            text: "Settings";
-            color: Theme.text;
-            font-size: 18px;
-            font-weight: 700;
+        // Tab bar — Capture / Image / Advanced
+        Rectangle {
+            x: 0; y: 0; width: 800px; height: 52px;
+            background: #0a0000;
+
+            HorizontalLayout {
+                spacing: 0; padding-left: 8px; padding-right: 8px;
+                padding-top: 6px; padding-bottom: 6px;
+
+                TouchArea {
+                    Rectangle {
+                        background: root.settings-tab == SettingsTab.Capture ? Theme.info : transparent;
+                        border-radius: 6px;
+                        Text {
+                            text: "Capture";
+                            color: Theme.text;
+                            font-size: 15px;
+                            font-weight: root.settings-tab == SettingsTab.Capture ? 700 : 400;
+                            horizontal-alignment: center; vertical-alignment: center;
+                        }
+                    }
+                    clicked => { root.settings-tab = SettingsTab.Capture; }
+                }
+                TouchArea {
+                    Rectangle {
+                        background: root.settings-tab == SettingsTab.Image ? Theme.info : transparent;
+                        border-radius: 6px;
+                        Text {
+                            text: "Image";
+                            color: Theme.text;
+                            font-size: 15px;
+                            font-weight: root.settings-tab == SettingsTab.Image ? 700 : 400;
+                            horizontal-alignment: center; vertical-alignment: center;
+                        }
+                    }
+                    clicked => { root.settings-tab = SettingsTab.Image; }
+                }
+                TouchArea {
+                    Rectangle {
+                        background: root.settings-tab == SettingsTab.Advanced ? Theme.info : transparent;
+                        border-radius: 6px;
+                        Text {
+                            text: "Advanced";
+                            color: Theme.text;
+                            font-size: 15px;
+                            font-weight: root.settings-tab == SettingsTab.Advanced ? 700 : 400;
+                            horizontal-alignment: center; vertical-alignment: center;
+                        }
+                    }
+                    clicked => { root.settings-tab = SettingsTab.Advanced; }
+                }
+            }
         }
 
-        ScrollView {
-            x: 0; y: 44px;
-            width: 800px; height: 376px;
+        // Tab content — only one is visible at a time
+        if root.settings-tab == SettingsTab.Capture: Rectangle {
+            x: 0; y: 56px; width: 800px; height: 364px;
+            background: transparent;
 
             VerticalLayout {
-                width: 780px;
-                spacing: 2px;
-                padding-left: 10px;
-                padding-right: 10px;
+                x: 0; width: 800px;
+                spacing: 4px;
+                padding-left: 10px; padding-right: 10px;
 
                 // ISO
                 SettingRow { label: "ISO";
@@ -361,7 +492,7 @@ export component AppWindow inherits Window {
                         x: 120px; spacing: 4px; padding: 4px;
                         for lbl[i] in ["Auto","100","200","400","800","1600","3200"]: FlatBtn {
                             label: lbl; active: root.iso-idx == i; width: 68px;
-                            active-color: #1565c0;
+                            active-color: Theme.info;
                             clicked => { root.iso-idx = i; }
                         }
                     }
@@ -373,7 +504,7 @@ export component AppWindow inherits Window {
                         x: 120px; spacing: 4px; padding: 4px;
                         for lbl[i] in ["Auto","1/4000","1/1000","1/500","1/250","1/60","1/30","1s"]: FlatBtn {
                             label: lbl; active: root.shutter-idx == i; width: 70px;
-                            active-color: #1565c0;
+                            active-color: Theme.info;
                             clicked => { root.shutter-idx = i; }
                         }
                     }
@@ -385,7 +516,7 @@ export component AppWindow inherits Window {
                         x: 120px; spacing: 4px; padding: 4px;
                         for lbl[i] in ["Auto","Incan","Tungst","Fluor","Indoor","Day","Cloudy"]: FlatBtn {
                             label: lbl; active: root.awb-idx == i; width: 72px;
-                            active-color: #1565c0;
+                            active-color: Theme.info;
                             clicked => { root.awb-idx = i; }
                         }
                     }
@@ -398,7 +529,7 @@ export component AppWindow inherits Window {
                         for v in [-2.0, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0]: FlatBtn {
                             label: v >= 0 ? "+" + v : "" + v;
                             active: abs(root.ev - v) < 0.01;
-                            active-color: #1565c0;
+                            active-color: Theme.info;
                             width: 60px;
                             clicked => { root.ev = v; }
                         }
@@ -412,20 +543,31 @@ export component AppWindow inherits Window {
                         for v in [1.0, 1.5, 2.0, 3.0, 4.0]: FlatBtn {
                             label: v + "×";
                             active: abs(root.zoom - v) < 0.01;
-                            active-color: #1565c0;
+                            active-color: Theme.info;
                             width: 64px;
                             clicked => { root.zoom = v; }
                         }
                     }
                 }
+            }
+        }
 
-                // Contrast / Saturation / Sharpness / Brightness sliders
+        // ── Image tab ──
+        if root.settings-tab == SettingsTab.Image: Rectangle {
+            x: 0; y: 56px; width: 800px; height: 364px;
+            background: transparent;
+
+            VerticalLayout {
+                x: 0; width: 800px;
+                spacing: 4px;
+                padding-left: 10px; padding-right: 10px;
+
                 SettingRow { label: "Contrast  " + root.contrast;
                     HorizontalLayout {
                         x: 180px; spacing: 6px; padding: 4px;
                         for v in [0.5, 0.75, 1.0, 1.25, 1.5, 2.0]: FlatBtn {
                             label: "" + v; active: abs(root.contrast - v) < 0.01;
-                            active-color: #1565c0; width: 60px;
+                            active-color: Theme.info; width: 60px;
                             clicked => { root.contrast = v; }
                         }
                     }
@@ -436,7 +578,7 @@ export component AppWindow inherits Window {
                         x: 180px; spacing: 6px; padding: 4px;
                         for v in [0.0, 0.5, 1.0, 1.5, 2.0]: FlatBtn {
                             label: "" + v; active: abs(root.saturation - v) < 0.01;
-                            active-color: #1565c0; width: 70px;
+                            active-color: Theme.info; width: 70px;
                             clicked => { root.saturation = v; }
                         }
                     }
@@ -447,7 +589,7 @@ export component AppWindow inherits Window {
                         x: 180px; spacing: 6px; padding: 4px;
                         for v in [0.0, 0.5, 1.0, 1.5, 2.0]: FlatBtn {
                             label: "" + v; active: abs(root.sharpness - v) < 0.01;
-                            active-color: #1565c0; width: 70px;
+                            active-color: Theme.info; width: 70px;
                             clicked => { root.sharpness = v; }
                         }
                     }
@@ -459,8 +601,79 @@ export component AppWindow inherits Window {
                         for v in [-0.5, -0.25, 0.0, 0.25, 0.5]: FlatBtn {
                             label: v >= 0 ? "+" + v : "" + v;
                             active: abs(root.brightness - v) < 0.01;
-                            active-color: #1565c0; width: 80px;
+                            active-color: Theme.info; width: 80px;
                             clicked => { root.brightness = v; }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── Advanced tab ──
+        if root.settings-tab == SettingsTab.Advanced: Rectangle {
+            x: 0; y: 56px; width: 800px; height: 364px;
+            background: transparent;
+
+            VerticalLayout {
+                x: 0; width: 800px;
+                spacing: 4px;
+                padding-left: 10px; padding-right: 10px;
+
+                // Live preview toggle
+                SettingRow { label: "Live Preview";
+                    HorizontalLayout {
+                        x: 180px; spacing: 6px; padding: 4px;
+                        FlatBtn {
+                            label: "ON"; active: root.stream-enabled;
+                            active-color: Theme.info; width: 80px;
+                            clicked => {
+                                root.stream-enabled = true;
+                                root.toggle-stream(true);
+                            }
+                        }
+                        FlatBtn {
+                            label: "OFF"; active: !root.stream-enabled;
+                            active-color: Theme.warn; width: 80px;
+                            clicked => {
+                                root.stream-enabled = false;
+                                root.toggle-stream(false);
+                            }
+                        }
+                    }
+                }
+
+                // Photo resolution
+                SettingRow { label: "Photo Res";
+                    HorizontalLayout {
+                        x: 180px; spacing: 6px; padding: 4px;
+                        for lbl[i] in ["12MP", "8MP", "5MP", "FHD"]: FlatBtn {
+                            label: lbl; active: root.photo-res-idx == i; width: 80px;
+                            active-color: Theme.info;
+                            clicked => { root.photo-res-idx = i; }
+                        }
+                    }
+                }
+
+                // Video resolution (ffmpeg scales output; camera always 1080p)
+                SettingRow { label: "Video Res";
+                    HorizontalLayout {
+                        x: 180px; spacing: 6px; padding: 4px;
+                        for lbl[i] in ["1080p", "720p", "480p"]: FlatBtn {
+                            label: lbl; active: root.video-res-idx == i; width: 90px;
+                            active-color: Theme.info;
+                            clicked => { root.video-res-idx = i; }
+                        }
+                    }
+                }
+
+                // Timelapse resolution
+                SettingRow { label: "TL Res";
+                    HorizontalLayout {
+                        x: 180px; spacing: 6px; padding: 4px;
+                        for lbl[i] in ["3MP", "FHD", "720p"]: FlatBtn {
+                            label: lbl; active: root.tl-res-idx == i; width: 90px;
+                            active-color: Theme.info;
+                            clicked => { root.tl-res-idx = i; }
                         }
                     }
                 }
@@ -489,33 +702,55 @@ export component AppWindow inherits Window {
         // Fullscreen selected item view
         if root.gallery-sel >= 0: Rectangle {
             background: #000000;
-            Text {
-                text: root.gallery-items[root.gallery-sel].name;
-                color: Theme.text; font-size: 13px;
-                x: 10px; y: 10px;
+
+            // Image (photo) or thumbnail (video first frame)
+            Image {
+                x: 0; y: 64px;
+                width: 800px; height: 356px;
+                source: root.gallery-preview-image;
+                image-fit: contain;
             }
-            TouchArea {
-                x: 700px; y: 5px; width: 90px; height: 40px;
-                Rectangle { background: Theme.accent; border-radius: 6px;
-                    Text { text: "Delete"; color: white; font-size: 13px;
-                           horizontal-alignment: center; vertical-alignment: center; } }
-                clicked => {
-                    root.delete-item(root.gallery-sel);
-                    root.gallery-sel = -1;
+
+            // Video badge — overlaid on thumbnail so user knows it's a video
+            if root.gallery-items[root.gallery-sel].is-video: Rectangle {
+                x: 350px; y: 200px;
+                width: 100px; height: 80px;
+                background: Theme.overlay;
+                border-radius: 8px;
+                Text {
+                    text: "▶";
+                    color: Theme.text; font-size: 48px;
+                    horizontal-alignment: center; vertical-alignment: center;
                 }
             }
-            TouchArea {
-                x: 600px; y: 5px; width: 90px; height: 40px;
-                Rectangle { background: Theme.surface; border-radius: 6px;
-                    Text { text: "Back"; color: white; font-size: 13px;
-                           horizontal-alignment: center; vertical-alignment: center; } }
-                clicked => { root.gallery-sel = -1; }
-            }
-            Text {
-                x: 0; y: 150px; width: 800px; height: 200px;
-                text: root.gallery-items[root.gallery-sel].is-video ? "📹 Video file\n" + root.gallery-items[root.gallery-sel].name : "📷 Photo\n" + root.gallery-items[root.gallery-sel].name;
-                color: Theme.dim; font-size: 14px;
-                horizontal-alignment: center; vertical-alignment: center;
+
+            // Top bar: filename + Delete + Back
+            Rectangle {
+                x: 0; y: 0; width: 800px; height: 56px;
+                background: Theme.overlay;
+                Text {
+                    text: root.gallery-items[root.gallery-sel].name;
+                    color: Theme.text; font-size: 14px;
+                    x: 16px; y: 0; height: parent.height;
+                    vertical-alignment: center;
+                }
+                TouchArea {
+                    x: 696px; y: 4px; width: 96px; height: 48px;
+                    Rectangle { background: Theme.accent; border-radius: 6px;
+                        Text { text: "Delete"; color: Theme.text; font-size: 14px;
+                               horizontal-alignment: center; vertical-alignment: center; } }
+                    clicked => {
+                        root.delete-item(root.gallery-sel);
+                        root.gallery-sel = -1;
+                    }
+                }
+                TouchArea {
+                    x: 592px; y: 4px; width: 96px; height: 48px;
+                    Rectangle { background: Theme.surface; border-radius: 6px;
+                        Text { text: "Back"; color: Theme.text; font-size: 14px;
+                               horizontal-alignment: center; vertical-alignment: center; } }
+                    clicked => { root.gallery-sel = -1; }
+                }
             }
         }
 
@@ -529,13 +764,15 @@ export component AppWindow inherits Window {
                 for item[i] in root.gallery-items: TouchArea {
                     height: 52px;
                     Rectangle {
-                        background: i == root.gallery-sel ? #333333 : Theme.surface;
+                        background: Theme.surface;
                         border-radius: 6px;
                         HorizontalLayout {
                             padding: 10px; spacing: 10px;
                             Text {
-                                text: item.is-video ? "🎬" : "📷";
-                                font-size: 20px; vertical-alignment: center; width: 30px;
+                                text: item.is-video ? "▶" : "◉";
+                                font-size: 20px; color: Theme.dim;
+                                vertical-alignment: center; width: 30px;
+                                horizontal-alignment: center;
                             }
                             Text {
                                 text: item.name;
@@ -545,7 +782,10 @@ export component AppWindow inherits Window {
                             }
                         }
                     }
-                    clicked => { root.gallery-sel = i; }
+                    clicked => {
+                        root.gallery-sel = i;
+                        root.select-gallery-item(i);
+                    }
                 }
             }
         }
@@ -562,39 +802,76 @@ export component AppWindow inherits Window {
             color: Theme.text; font-size: 18px; font-weight: 700;
         }
 
+        Text {
+            x: 16px; y: 40px;
+            text: "Hold for 1.5s to confirm — protects against stray taps during imaging.";
+            color: Theme.dim; font-size: 12px;
+        }
+
         VerticalLayout {
-            x: 240px; y: 100px;
-            width: 320px;
-            spacing: 16px;
+            x: 220px; y: 90px;
+            width: 360px;
+            spacing: 18px;
 
-            TouchArea {
-                height: 60px;
+            shutdown-ta := TouchArea {
+                height: 64px;
                 Rectangle {
-                    background: Theme.accent; border-radius: 10px;
+                    background: Theme.surface;
+                    border-radius: 10px;
+                    border-width: 2px;
+                    border-color: Theme.accent;
+                    // Progress fill while held
+                    Rectangle {
+                        x: 0; y: 0; height: parent.height;
+                        width: shutdown-ta.pressed ? parent.width : 0px;
+                        background: Theme.accent;
+                        border-radius: 10px;
+                        animate width { duration: 1500ms; easing: linear; }
+                    }
                     Text { text: "⏻  Shut Down";
-                           color: white; font-size: 18px;
+                           color: Theme.text; font-size: 18px; font-weight: 700;
                            horizontal-alignment: center; vertical-alignment: center; }
                 }
-                clicked => { root.shutdown-system(); }
+                // Fire only after 1.5s hold; reset if released early
+                Timer {
+                    interval: 1500ms;
+                    running: shutdown-ta.pressed;
+                    triggered => { root.shutdown-system(); }
+                }
             }
 
-            TouchArea {
-                height: 60px;
+            reboot-ta := TouchArea {
+                height: 64px;
                 Rectangle {
-                    background: #e65100; border-radius: 10px;
+                    background: Theme.surface;
+                    border-radius: 10px;
+                    border-width: 2px;
+                    border-color: Theme.warn;
+                    Rectangle {
+                        x: 0; y: 0; height: parent.height;
+                        width: reboot-ta.pressed ? parent.width : 0px;
+                        background: Theme.warn;
+                        border-radius: 10px;
+                        animate width { duration: 1500ms; easing: linear; }
+                    }
                     Text { text: "↺  Reboot";
-                           color: white; font-size: 18px;
+                           color: Theme.text; font-size: 18px;
                            horizontal-alignment: center; vertical-alignment: center; }
                 }
-                clicked => { root.reboot-system(); }
+                Timer {
+                    interval: 1500ms;
+                    running: reboot-ta.pressed;
+                    triggered => { root.reboot-system(); }
+                }
             }
 
+            // Restart App is cheap to recover from, so single-tap is fine.
             TouchArea {
-                height: 60px;
+                height: 56px;
                 Rectangle {
-                    background: #1565c0; border-radius: 10px;
+                    background: Theme.info; border-radius: 10px;
                     Text { text: "⟳  Restart App";
-                           color: white; font-size: 18px;
+                           color: Theme.text; font-size: 16px;
                            horizontal-alignment: center; vertical-alignment: center; }
                 }
                 clicked => { root.restart-app(); }

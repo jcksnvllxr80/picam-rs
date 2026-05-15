@@ -18,6 +18,26 @@ const PREVIEW_H: u32 = 480;
 const RECORD_W:  u32 = 1920;
 const RECORD_H:  u32 = 1080;
 
+// Resolution presets exposed to the UI (idx → (w, h)).
+// Photo defaults to full 12MP (IMX477 native). Video output is scaled by ffmpeg
+// — the libcamera record stream is always 1920×1080 regardless of choice.
+pub const PHOTO_RESOLUTIONS: &[(u32, u32, &str)] = &[
+    (4056, 3040, "12MP"),
+    (3280, 2464,  "8MP"),
+    (2592, 1944,  "5MP"),
+    (1920, 1080, "FHD"),
+];
+pub const VIDEO_RESOLUTIONS: &[(u32, u32, &str)] = &[
+    (1920, 1080, "1080p"),
+    (1280,  720,  "720p"),
+    ( 854,  480,  "480p"),
+];
+pub const TL_RESOLUTIONS: &[(u32, u32, &str)] = &[
+    (2028, 1520,  "3MP"),
+    (1920, 1080,  "FHD"),
+    (1280,  720,  "720p"),
+];
+
 // ── FFI bindings ──────────────────────────────────────────────────────────────
 
 #[repr(C)]
@@ -125,8 +145,17 @@ struct RecordingState {
 
 // ── FFI callback context (heap-pinned, shared with C++) ───────────────────────
 
+struct Nv12Frame {
+    data:   Vec<u8>,
+    width:  u32,
+    height: u32,
+}
+
 struct CallbackCtx {
-    frame_tx:  Sender<CameraEvent>,
+    // NV12 bytes shipped to a worker thread for conversion.
+    // The libcamera completion thread MUST stay fast (memcpy + try_send only),
+    // or the camera pipeline backs up and drops frames at the hardware level.
+    nv12_tx:   Sender<Nv12Frame>,
     recording: Arc<Mutex<Option<RecordingState>>>,
 }
 
@@ -136,8 +165,8 @@ unsafe extern "C" fn on_preview_frame(
 ) {
     let ctx = &*(ctx as *const CallbackCtx);
     let nv12 = std::slice::from_raw_parts(data, len);
-    let rgba = nv12_to_rgba(nv12, width, height);
-    let _ = ctx.frame_tx.try_send(CameraEvent::Frame { rgba, width, height });
+    let frame = Nv12Frame { data: nv12.to_vec(), width, height };
+    let _ = ctx.nv12_tx.try_send(frame);
 }
 
 unsafe extern "C" fn on_record_frame(
@@ -191,6 +220,11 @@ pub struct Camera {
     handle:       *mut PicamHandle,
     recording:    Arc<Mutex<Option<RecordingState>>>,
     paused:       Arc<AtomicBool>,
+    // User-controlled — true when the user wants live preview on.
+    // Differs from `paused`, which is set briefly during captures regardless of
+    // user preference. capture_photo() must NOT auto-resume if the user
+    // disabled the stream.
+    stream_enabled: Arc<AtomicBool>,
     // keeps callback context alive for the lifetime of the camera
     _ctx:         Box<CallbackCtx>,
 }
@@ -207,11 +241,32 @@ impl Camera {
             let _ = std::fs::create_dir_all(d);
         }
 
-        let (tx, rx) = bounded(4);
+        // Two channels:
+        //   nv12: libcamera completion thread → conversion worker
+        //   frame: conversion worker → Slint event loop
+        // Bounded(2) on each so backpressure naturally drops frames if a stage
+        // can't keep up, rather than queueing memory indefinitely.
+        let (nv12_tx, nv12_rx) = bounded::<Nv12Frame>(2);
+        let (frame_tx, frame_rx) = bounded::<CameraEvent>(2);
         let recording = Arc::new(Mutex::new(None::<RecordingState>));
 
+        // Conversion worker: takes raw NV12, produces RGBA8, ships to UI.
+        thread::Builder::new()
+            .name("nv12-rgba".into())
+            .spawn(move || {
+                while let Ok(frame) = nv12_rx.recv() {
+                    let rgba = nv12_to_rgba(&frame.data, frame.width, frame.height);
+                    let _ = frame_tx.try_send(CameraEvent::Frame {
+                        rgba,
+                        width:  frame.width,
+                        height: frame.height,
+                    });
+                }
+            })
+            .expect("spawn nv12-rgba worker");
+
         let ctx = Box::new(CallbackCtx {
-            frame_tx:  tx,
+            nv12_tx,
             recording: Arc::clone(&recording),
         });
         let ctx_ptr = &*ctx as *const CallbackCtx as *mut std::ffi::c_void;
@@ -232,12 +287,27 @@ impl Camera {
 
         Camera {
             settings: Arc::new(Mutex::new(CameraSettings::default())),
-            frame_rx: rx,
+            frame_rx,
             handle,
             recording,
             paused: Arc::new(AtomicBool::new(false)),
+            stream_enabled: Arc::new(AtomicBool::new(true)),
             _ctx: ctx,
         }
+    }
+
+    pub fn set_stream_enabled(&self, on: bool) {
+        let prev = self.stream_enabled.swap(on, Ordering::Relaxed);
+        if prev == on { return; }
+        if on {
+            unsafe { picam_resume(self.handle); }
+        } else {
+            unsafe { picam_pause(self.handle); }
+        }
+    }
+
+    pub fn is_stream_enabled(&self) -> bool {
+        self.stream_enabled.load(Ordering::Relaxed)
     }
 
     pub fn update_settings(&self, s: CameraSettings) {
@@ -282,65 +352,88 @@ impl Camera {
 
     // ── Photo capture ─────────────────────────────────────────────────────────
 
-    pub fn capture_photo(&self) -> Result<PathBuf> {
+    pub fn capture_photo(&self, width: u32, height: u32) -> Result<PathBuf> {
         if self.is_recording() {
             anyhow::bail!("Stop recording before taking a photo");
         }
         let ts   = timestamp_ms();
         let path = PathBuf::from(SAVE_DIR).join(format!("IMG_{ts}.jpg"));
         let s    = self.settings.lock().unwrap().clone();
+        let w_str = width.to_string();
+        let h_str = height.to_string();
 
-        self.pause_preview();
+        self.pause_for_capture();
         let mut cmd = Command::new("rpicam-still");
         cmd.args([
             "--output", path.to_str().unwrap(),
             "--timeout", "200",
             "--rotation", "180",
-            "--width",  "4056",
-            "--height", "3040",
+            "--width",  &w_str,
+            "--height", &h_str,
             "--nopreview",
             "--immediate",
         ]);
         for a in build_rpicam_args(&s) { cmd.arg(a); }
         let status = cmd.status().context("rpicam-still failed");
-        self.resume_preview();
+        self.resume_after_capture();
 
         let status = status?;
         if !status.success() { anyhow::bail!("rpicam-still exited {:?}", status.code()); }
         Ok(path)
     }
 
-    fn pause_preview(&self) {
+    // Used during photo/timelapse capture only — respects the user's
+    // stream_enabled preference on resume (so we don't auto-enable preview
+    // that the user explicitly disabled in Advanced settings).
+    fn pause_for_capture(&self) {
         self.paused.store(true, Ordering::Relaxed);
         unsafe { picam_pause(self.handle); }
-        thread::sleep(Duration::from_millis(200));
+        // libcamera needs a beat to fully release the pipeline handler before
+        // rpicam-still can acquire it. 500ms is conservative; could probably
+        // drop to 300ms but we'd rather be reliable than fast for captures.
+        thread::sleep(Duration::from_millis(500));
     }
 
-    fn resume_preview(&self) {
-        unsafe { picam_resume(self.handle); }
+    fn resume_after_capture(&self) {
+        if self.stream_enabled.load(Ordering::Relaxed) {
+            unsafe { picam_resume(self.handle); }
+        }
         self.paused.store(false, Ordering::Relaxed);
     }
 
     // ── Video recording ───────────────────────────────────────────────────────
 
-    pub fn start_recording(&self) -> Result<PathBuf> {
+    pub fn start_recording(&self, out_width: u32, out_height: u32) -> Result<PathBuf> {
         let ts       = timestamp_ms();
         let out_path = PathBuf::from(VIDEO_DIR).join(format!("VID_{ts}.mp4"));
 
-        // Pipe NV12 frames directly into ffmpeg for real-time H264 encoding
+        // libcamera always streams at RECORD_W×RECORD_H (1080p). If the user
+        // chose a smaller output, ffmpeg downscales via the scale filter.
+        let input_size = format!("{}x{}", RECORD_W, RECORD_H);
+        let scale_arg  = format!("scale={}:{}", out_width, out_height);
+        let needs_scale = out_width != RECORD_W || out_height != RECORD_H;
+
+        let mut args: Vec<&str> = vec![
+            "-y",
+            "-f",         "rawvideo",
+            "-pix_fmt",   "nv12",
+            "-s",         &input_size,
+            "-r",         "25",
+            "-i",         "pipe:0",
+        ];
+        if needs_scale {
+            args.push("-vf");
+            args.push(&scale_arg);
+        }
+        args.extend_from_slice(&[
+            "-c:v",       "libx264",
+            "-preset",    "fast",
+            "-pix_fmt",   "yuv420p",
+            out_path.to_str().unwrap(),
+        ]);
+
         let mut child = Command::new("ffmpeg")
-            .args([
-                "-y",
-                "-f",         "rawvideo",
-                "-pix_fmt",   "nv12",
-                "-s",         &format!("{}x{}", RECORD_W, RECORD_H),
-                "-r",         "25",
-                "-i",         "pipe:0",
-                "-c:v",       "libx264",
-                "-preset",    "fast",
-                "-pix_fmt",   "yuv420p",
-                out_path.to_str().unwrap(),
-            ])
+            .args(&args)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -367,9 +460,24 @@ impl Camera {
         let out_path = state.out_path.clone();
 
         // Close the ffmpeg stdin pipe so ffmpeg finalises the file, then wait
+        // and extract a thumbnail JPEG (used as the gallery preview).
         thread::spawn(move || {
             drop(state.ffmpeg_stdin); // EOF → ffmpeg writes trailer and exits
             let _ = { let mut c = state.ffmpeg_child; c.wait() };
+
+            let thumb_path = state.out_path.with_extension("thumb.jpg");
+            let _ = Command::new("ffmpeg")
+                .args([
+                    "-y",
+                    "-i", state.out_path.to_str().unwrap(),
+                    "-vframes", "1",
+                    "-q:v", "4",
+                    thumb_path.to_str().unwrap(),
+                ])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+
             on_done();
         });
 
@@ -389,24 +497,28 @@ impl Camera {
 
     // ── Timelapse frame ───────────────────────────────────────────────────────
 
-    pub fn capture_timelapse_frame(&self, index: usize, session_dir: &str) -> Result<PathBuf> {
+    pub fn capture_timelapse_frame(
+        &self, index: usize, session_dir: &str, width: u32, height: u32,
+    ) -> Result<PathBuf> {
         let path = PathBuf::from(session_dir).join(format!("frame_{index:06}.jpg"));
         let s    = self.settings.lock().unwrap().clone();
+        let w_str = width.to_string();
+        let h_str = height.to_string();
 
-        self.pause_preview();
+        self.pause_for_capture();
         let mut cmd = Command::new("rpicam-still");
         cmd.args([
             "--output", path.to_str().unwrap(),
             "--timeout", "200",
             "--rotation", "180",
-            "--width",  "2028",
-            "--height", "1520",
+            "--width",  &w_str,
+            "--height", &h_str,
             "--nopreview",
             "--immediate",
         ]);
         for a in build_rpicam_args(&s) { cmd.arg(a); }
         let status = cmd.status().context("rpicam-still timelapse failed");
-        self.resume_preview();
+        self.resume_after_capture();
 
         let status = status?;
         if !status.success() { anyhow::bail!("rpicam-still exited {:?}", status.code()); }
