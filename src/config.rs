@@ -79,6 +79,7 @@ pub struct GeneralDefaults {
     pub self_timer_idx:    usize, // 0=off, 1=2s, 2=5s, 3=10s
     pub burst_count_idx:   usize, // 0=1, 1=3, 2=5, 3=10
     pub last_shot_enabled: bool,
+    pub sleep_timeout_idx: usize, // 0=off, 1=30s, 2=1m, 3=5m, 4=10m, 5=30m
 }
 
 impl Default for GeneralDefaults {
@@ -87,6 +88,7 @@ impl Default for GeneralDefaults {
             self_timer_idx:    0,
             burst_count_idx:   0,
             last_shot_enabled: true,
+            sleep_timeout_idx: 0,
         }
     }
 }

@@ -126,14 +126,15 @@ fn serve_client(
         ("POST", "/api/capture")  => api_capture(stream, &camera),
         ("POST", "/api/record/start") => api_record_start(stream, &camera),
         ("POST", "/api/record/stop")  => api_record_stop(stream, &camera),
-        ("GET",  "/api/gallery")      => api_gallery_list(stream),
-        ("GET",  "/api/gallery/file") => api_gallery_file(stream, query),
+        ("GET",    "/api/gallery")      => api_gallery_list(stream),
+        ("GET",    "/api/gallery/file") => api_gallery_file(stream, query),
+        ("DELETE", "/api/gallery/file") => api_gallery_delete(stream, query),
         _ => serve_404(stream),
     }
 }
 
-/// Parse a key from a URL query string. Returns the value (URL-decoded
-/// minimally — we only deal with our own filenames so no %-encoding needed).
+/// Parse a key from a URL query string. Returns the raw (still percent-encoded)
+/// value — callers that need a real path must run it through `url_decode`.
 fn query_param<'a>(query: &'a str, key: &str) -> Option<&'a str> {
     for pair in query.split('&') {
         if let Some((k, v)) = pair.split_once('=') {
@@ -141,6 +142,33 @@ fn query_param<'a>(query: &'a str, key: &str) -> Option<&'a str> {
         }
     }
     None
+}
+
+/// Percent-decode a URL query value. Handles `%XX` and `+` → space.
+/// Browser's encodeURIComponent encodes `/` as `%2F`; without this decode,
+/// our file path lookups would always fail.
+fn url_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => { out.push(b' '); i += 1; }
+            b'%' if i + 2 < bytes.len() => {
+                if let Ok(b) = u8::from_str_radix(
+                    std::str::from_utf8(&bytes[i+1..i+3]).unwrap_or(""), 16,
+                ) {
+                    out.push(b);
+                    i += 3;
+                } else {
+                    out.push(bytes[i]);
+                    i += 1;
+                }
+            }
+            _ => { out.push(bytes[i]); i += 1; }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 // ── Static HTML responses ────────────────────────────────────────────────────
@@ -301,29 +329,26 @@ fn api_gallery_list(stream: TcpStream) {
 }
 
 fn api_gallery_file(stream: TcpStream, query: &str) {
-    let Some(req_path) = query_param(query, "path") else {
+    let Some(raw) = query_param(query, "path") else {
         return serve_json(stream, 400, r#"{"error":"missing path"}"#);
     };
+    let req_path = url_decode(raw);
 
     // Security: only serve files that gallery::scan returns. Anything else
     // (path traversal, symlinks pointing elsewhere, etc.) gets a 404. We also
     // optionally serve the .thumb.jpg sidecar for videos.
     let items = gallery::scan(&[SAVE_DIR, VIDEO_DIR, TL_DIR]);
     let allowed = items.iter().any(|i| i.path == req_path);
-
-    // Also allow the .thumb.jpg sidecar for video items: VID_xxx.mp4 has a
-    // VID_xxx.thumb.jpg next to it that gallery::scan filters out.
     let is_thumb_sidecar = if let Some(base) = req_path.strip_suffix(".thumb.jpg") {
         items.iter().any(|i| i.is_video && i.path.starts_with(base))
     } else {
         false
     };
-
     if !allowed && !is_thumb_sidecar {
         return serve_404(stream);
     }
 
-    let Ok(bytes) = std::fs::read(req_path) else {
+    let Ok(bytes) = std::fs::read(&req_path) else {
         return serve_404(stream);
     };
 
@@ -348,6 +373,22 @@ fn api_gallery_file(stream: TcpStream, query: &str) {
     let mut s = stream;
     if s.write_all(header.as_bytes()).is_ok() {
         let _ = s.write_all(&bytes);
+    }
+}
+
+fn api_gallery_delete(stream: TcpStream, query: &str) {
+    let Some(raw) = query_param(query, "path") else {
+        return serve_json(stream, 400, r#"{"error":"missing path"}"#);
+    };
+    let req_path = url_decode(raw);
+    let items = gallery::scan(&[SAVE_DIR, VIDEO_DIR, TL_DIR]);
+    if !items.iter().any(|i| i.path == req_path) {
+        return serve_404(stream);
+    }
+    if gallery::delete(&req_path) {
+        serve_json(stream, 200, r#"{"ok":true}"#);
+    } else {
+        serve_json(stream, 500, r#"{"ok":false,"error":"delete failed"}"#);
     }
 }
 
@@ -439,11 +480,12 @@ body{display:flex;flex-direction:column;padding:env(safe-area-inset-top) env(saf
 .gallery-item .video-badge{position:absolute;top:4px;right:4px;background:var(--accent);color:var(--text);font-size:10px;font-weight:700;padding:2px 5px;border-radius:3px;}
 .gallery-item .name{position:absolute;bottom:0;left:0;right:0;background:var(--overlay);color:var(--text);font-size:10px;padding:3px 6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
 .gallery-empty{color:var(--dim);font-size:13px;text-align:center;padding:32px;}
-.lightbox{position:fixed;inset:0;background:rgba(0,0,0,0.95);display:none;align-items:center;justify-content:center;z-index:20;}
+.lightbox{position:fixed;inset:0;background:#000;display:none;align-items:center;justify-content:center;z-index:20;width:100vw;height:100vh;}
 .lightbox.open{display:flex;}
-.lightbox img{max-width:100%;max-height:100%;}
-.lightbox .close{position:absolute;top:8px;right:8px;background:var(--surface);color:var(--text);border:1px solid var(--text);border-radius:6px;font-family:inherit;font-size:14px;padding:10px 16px;cursor:pointer;}
-.lightbox .caption{position:absolute;bottom:8px;left:8px;right:8px;background:var(--overlay);color:var(--text);font-size:12px;padding:8px;border-radius:4px;text-align:center;}
+.lightbox img,.lightbox video{max-width:100vw;max-height:100vh;width:auto;height:auto;display:block;}
+.lightbox .close{position:absolute;top:env(safe-area-inset-top,8px);right:8px;background:var(--surface);color:var(--text);border:1px solid var(--text);border-radius:6px;font-family:inherit;font-size:13px;padding:10px 14px;cursor:pointer;z-index:30;}
+.lightbox .delete{position:absolute;top:env(safe-area-inset-top,8px);left:8px;background:var(--accent);color:var(--text);border:1px solid var(--text);border-radius:6px;font-family:inherit;font-size:13px;padding:10px 14px;cursor:pointer;z-index:30;}
+.lightbox .caption{position:absolute;bottom:env(safe-area-inset-bottom,8px);left:8px;right:8px;background:var(--overlay);color:var(--text);font-size:11px;padding:6px 8px;border-radius:4px;text-align:center;z-index:30;}
 @media (orientation:landscape) and (min-width:720px){
   body{flex-direction:row;flex-wrap:wrap;}
   .status{width:100%;}
@@ -486,8 +528,9 @@ body{display:flex;flex-direction:column;padding:env(safe-area-inset-top) env(saf
   </div>
 </div>
 <div class="lightbox" id="lightbox">
+  <button class="delete" id="lightbox-delete">Delete</button>
   <button class="close" id="lightbox-close">Close</button>
-  <img id="lightbox-img" alt="">
+  <div id="lightbox-media-container" style="display:flex;align-items:center;justify-content:center;width:100%;height:100%;"></div>
   <div class="caption" id="lightbox-caption"></div>
 </div>
 <script>
@@ -559,7 +602,7 @@ $('gallery-btn').addEventListener('click', async () => {
       const thumbUrl  = '/api/gallery/file?path=' + encodeURIComponent(thumbPath);
       const fullUrl   = '/api/gallery/file?path=' + encodeURIComponent(item.path);
       const badge     = item.is_video ? '<div class="video-badge">VIDEO</div>' : '';
-      return '<div class="gallery-item" data-full="' + fullUrl + '" data-name="' + item.name + '" data-video="' + item.is_video + '">'
+      return '<div class="gallery-item" data-full="' + fullUrl + '" data-path="' + encodeURIComponent(item.path) + '" data-name="' + item.name + '" data-video="' + item.is_video + '">'
         + '<img src="' + thumbUrl + '" alt="' + item.name + '" loading="lazy">'
         + badge
         + '<div class="name">' + item.name + '</div>'
@@ -569,22 +612,7 @@ $('gallery-btn').addEventListener('click', async () => {
 
     document.querySelectorAll('.gallery-item').forEach(el => {
       el.addEventListener('click', () => {
-        const isVideo = el.dataset.video === 'true';
-        if (isVideo) {
-          // Video playback in browser: serve the .mp4 directly via <video>
-          const v = document.createElement('video');
-          v.controls = true;
-          v.autoplay = true;
-          v.style.maxWidth = '100%';
-          v.style.maxHeight = '100%';
-          v.src = el.dataset.full;
-          $('lightbox-img').replaceWith(v);
-          v.id = 'lightbox-img';
-        } else {
-          $('lightbox-img').src = el.dataset.full;
-        }
-        $('lightbox-caption').textContent = el.dataset.name;
-        $('lightbox').classList.add('open');
+        openLightbox(el.dataset.full, el.dataset.name, el.dataset.video === 'true', el.dataset.path);
       });
     });
   } catch (e) {
@@ -594,8 +622,68 @@ $('gallery-btn').addEventListener('click', async () => {
 
 $('drawer-close').addEventListener('click', () => $('drawer').classList.remove('open'));
 $('drawer').addEventListener('click', (e) => { if (e.target === $('drawer')) $('drawer').classList.remove('open'); });
-$('lightbox-close').addEventListener('click', () => $('lightbox').classList.remove('open'));
-$('lightbox').addEventListener('click', (e) => { if (e.target === $('lightbox')) $('lightbox').classList.remove('open'); });
+
+// Lightbox state — tracks the current item for the Delete button
+let currentLightboxPath = null;
+
+function openLightbox(fullUrl, name, isVideo, encodedPath) {
+  const c = $('lightbox-media-container');
+  c.innerHTML = '';
+  if (isVideo) {
+    const v = document.createElement('video');
+    v.controls = true;
+    v.autoplay = true;
+    v.playsInline = true;       // iOS Safari: stay inline, no native fullscreen takeover
+    v.src = fullUrl;
+    c.appendChild(v);
+  } else {
+    const img = document.createElement('img');
+    img.src = fullUrl;
+    img.alt = name;
+    c.appendChild(img);
+  }
+  $('lightbox-caption').textContent = name;
+  currentLightboxPath = encodedPath;
+  $('lightbox').classList.add('open');
+
+  // Request true browser fullscreen — gets rid of address bar, fills the
+  // device screen, respects rotation natively via the browser. Best-effort:
+  // iOS Safari only supports this on <video> elements (handled below).
+  const root = document.documentElement;
+  if (root.requestFullscreen) {
+    root.requestFullscreen({ navigationUI: 'hide' }).catch(() => {});
+  } else if (root.webkitRequestFullscreen) {
+    root.webkitRequestFullscreen();
+  }
+}
+
+function closeLightbox() {
+  $('lightbox').classList.remove('open');
+  $('lightbox-media-container').innerHTML = '';
+  currentLightboxPath = null;
+  if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
+  else if (document.webkitFullscreenElement) document.webkitExitFullscreen();
+}
+
+$('lightbox-close').addEventListener('click', closeLightbox);
+$('lightbox').addEventListener('click', (e) => {
+  // Tap on the dark background (not on the image/buttons) closes too
+  if (e.target === $('lightbox') || e.target.id === 'lightbox-media-container') closeLightbox();
+});
+
+$('lightbox-delete').addEventListener('click', async () => {
+  if (!currentLightboxPath) return;
+  if (!confirm('Delete this file? This cannot be undone.')) return;
+  try {
+    const r = await fetch('/api/gallery/file?path=' + currentLightboxPath, { method: 'DELETE' });
+    if (!r.ok) throw new Error('delete ' + r.status);
+    closeLightbox();
+    // Refresh the gallery drawer
+    $('gallery-btn').click();
+  } catch (e) {
+    alert('Delete failed: ' + e.message);
+  }
+});
 
 async function pollState() {
   try {

@@ -81,6 +81,7 @@ fn main() {
     app.set_self_timer_idx (cfg.general.self_timer_idx  as i32);
     app.set_burst_count_idx(cfg.general.burst_count_idx as i32);
     app.set_last_shot_enabled(cfg.general.last_shot_enabled);
+    app.set_sleep_timeout_idx(cfg.general.sleep_timeout_idx as i32);
     app.set_stream_port    (cfg.stream.local_port as i32);
     app.set_push_url       (cfg.stream.push_url.clone().into());
 

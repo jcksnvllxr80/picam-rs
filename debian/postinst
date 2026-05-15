@@ -38,7 +38,34 @@ EOF
             fi
         fi
 
-        # 4. Reload systemd so getty override and picam.service are visible.
+        # 4. Blank XCursor theme so the touchscreen has no visible mouse pointer.
+        # Each "cursor" is a valid 68-byte 1x1 transparent XCursor file —
+        # libcursor accepts them and renders nothing. Empty files fail to
+        # parse and fall back to the system default (visible) cursor.
+        if [ ! -f /usr/share/icons/blank/cursors/default ]; then
+            mkdir -p /usr/share/icons/blank/cursors
+            cat > /usr/share/icons/blank/index.theme <<'IDX'
+[Icon Theme]
+Name=blank
+Comment=Empty cursor theme for picam-rs touchscreen kiosk
+IDX
+            python3 - <<'PY' || true
+import struct, os
+# Valid XCursor: header(16) + toc(12) + image_chunk_header(36) + 1px_pixels(4)
+data  = struct.pack("<4sIII", b"Xcur", 16, 0x10000, 1)
+data += struct.pack("<III", 0xfffd0002, 1, 28)
+data += struct.pack("<IIIIIIIIII", 36, 0xfffd0002, 1, 1, 1, 1, 0, 0, 0, 0)
+names = ["default","left_ptr","arrow","watch","xterm","hand2","hand1","fleur",
+         "sb_h_double_arrow","sb_v_double_arrow","size_fdiag","size_bdiag","crosshair",
+         "pointer","text","wait","help","question_arrow","left_arrow","right_arrow",
+         "top_left_corner","top_right_corner","bottom_left_corner","bottom_right_corner",
+         "top_side","left_side","right_side","bottom_side","grab","grabbing","tcross"]
+for n in names:
+    open(f"/usr/share/icons/blank/cursors/{n}", "wb").write(data)
+PY
+        fi
+
+        # 5. Reload systemd so getty override and picam.service are visible.
         systemctl daemon-reload || true
         systemctl enable getty@tty1.service >/dev/null 2>&1 || true
 

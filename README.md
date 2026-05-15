@@ -42,16 +42,29 @@ The entire UI is a monochrome red palette to preserve dark adaptation; the scree
 **Gallery**
 
 - Photo full-screen preview by tapping any item
+- Video playback in-app via `mpv` fullscreen — tap the ▶ overlay on a video; press `q` or `Esc` to return
 - Video first-frame thumbnail extracted by ffmpeg at recording stop
 - Delete (also removes the `.thumb.jpg` sidecar)
+- Auto-refresh on Gallery tab tap — picks up captures from `/control` and side-channel additions
 - Newest first
+
+**Mobile web companion (`/control`)**
+
+- Point any phone or laptop browser at `http://<pi-host>:8080/control` for a touch-optimised remote control
+- IBM Plex Mono monospace UI on the same astro-red palette as the touchscreen
+- Live preview, mode selector (Photo / Video), capture / record buttons with progress feedback
+- Gallery drawer: thumbnail grid, fullscreen lightbox (image or video), delete with confirmation
+- Tapping a thumbnail triggers the browser Fullscreen API — no address bar, rotation-aware
+- HTTP/MJPEG also served at `/stream` for VLC, OBS, ffmpeg, or any other MJPEG consumer
 
 **UX**
 
 - Red astro theme — no white, blue, or green anywhere in the UI
-- Tabbed Settings (Capture / Image / Advanced / General)
+- No visible mouse cursor on the touchscreen (1×1 transparent XCursor theme + `mouse-cursor: none` on every TouchArea)
+- Tabbed Settings (Capture / Image / Advanced / Stream / General)
 - Last-shot review thumbnail flashes for 2s after capture (toggleable)
 - Storage-free indicator in the General tab
+- Screen sleep with configurable timeout (Off / 30s / 1m / 5m / 10m / 30m) — any tap wakes the screen
 - Hold-to-confirm Shutdown and Reboot (1.5s) — protects against stray taps during imaging
 - Power menu: Shutdown / Reboot / Restart App
 
@@ -75,8 +88,13 @@ Install system dependencies on the Pi:
 ```bash
 sudo apt install -y \
     libcamera-dev \
+    libjpeg62-turbo-dev \
+    libfontconfig1-dev \
+    libxkbcommon-dev \
+    libwayland-dev \
     rpicam-apps \
     ffmpeg \
+    mpv \
     cage \
     build-essential \
     pkg-config
@@ -95,9 +113,10 @@ Versions used in development:
 |----------------|---------|
 | Rust (stable) | 1.95 |
 | Slint | 1.16 |
-| libcamera | 0.7.1 |
+| libcamera | 0.7.1 (Raspberry Pi fork — `+rpt*`) |
 | rpicam-apps | system package (for photo/timelapse capture) |
 | ffmpeg | system package |
+| mpv | system package (for in-gallery video playback) |
 | cage | 0.2 |
 
 ---
@@ -232,6 +251,34 @@ Still photos use `rpicam-still` for full 12MP resolution. Because libcamera hold
 
 For long exposures, `rpicam-still --timeout` is padded to exceed the shutter length (capture would otherwise be cut short).
 
+### Mobile web companion (`/control`)
+
+An embedded HTTP server (hand-written multipart MJPEG + JSON router, no external dependencies) runs on port 8080 by default. It serves three surfaces:
+
+| Path | Purpose |
+|------|---------|
+| `GET /control` | Touch-optimised HTML control page (IBM Plex Mono on the astro-red palette) |
+| `GET /stream` | Multipart MJPEG live preview for browsers, VLC, OBS, ffmpeg, etc. |
+| `GET /` | Landing page with links to `/control` and `/stream` |
+
+The control page polls a small JSON API for state and posts back capture commands:
+
+| Method | Path | Body / Query | Returns |
+|---|---|---|---|
+| `GET` | `/api/state` | — | `{recording, duration, free_space, preview}` |
+| `POST` | `/api/capture` | — | `{ok, path}` — fires a 12MP photo |
+| `POST` | `/api/record/start` | — | `{ok, path}` — start 1080p H264 recording |
+| `POST` | `/api/record/stop` | — | `{ok}` |
+| `GET` | `/api/gallery` | — | `[{path, name, is_video}, ...]` |
+| `GET` | `/api/gallery/file` | `?path=...` | File bytes with correct Content-Type |
+| `DELETE` | `/api/gallery/file` | `?path=...` | `{ok}` — also removes the `.thumb.jpg` sidecar |
+
+The server requires *path validity* against `gallery::scan()` — any request for a path outside `/home/pi/Pictures/picam`, `/home/pi/Videos/picam`, or `/home/pi/Pictures/timelapse` gets a 404 even if the file exists. URL-percent-encoded paths are decoded server-side.
+
+Streaming sinks (configured in `[stream]` of the TOML config):
+- `local_port` — bind port for the HTTP/MJPEG server (default 8080)
+- `push_url` — optional RTMP/SRT/MPEG-TS URL; when set and enabled, an ffmpeg subprocess pushes H264 to that destination from the same preview stream
+
 ### Capture settings table
 
 Most settings are applied as libcamera controls on the next queued request (no restart needed):
@@ -252,14 +299,19 @@ Most settings are applied as libcamera controls on the next queued request (no r
 
 ## Settings UI
 
-The Settings page is organised into four tabs so each fits on the 480px screen without scrolling:
+The Settings page is organised into five tabs so each fits on the 480px screen without scrolling:
 
 | Tab | Contents |
 |-----|----------|
 | **Capture** | ISO, Shutter (two rows — short and long exposures), AWB, EV, Zoom |
 | **Image** | Contrast, Saturation, Sharpness, Brightness |
 | **Advanced** | Live Preview on/off, Photo Res, Video Res, TL Res, RAW (DNG) capture |
-| **General** | Self-Timer, Burst, Last-Shot Review, Storage Free |
+| **Stream** | HTTP/MJPEG server on/off + port, push-URL on/off, Reload config |
+| **General** | Self-Timer, Burst, Last-Shot Review, **Sleep Timeout**, Storage Free |
+
+### Screen sleep
+
+`General → Sleep Timeout` blanks the screen after N seconds of touch inactivity. Any tap wakes it. Powered by a Slint `pointer-event` back-layer that resets a global idle counter without instrumenting every individual button — same trick that hides the cursor (`mouse-cursor: none`).
 
 ---
 
@@ -340,10 +392,10 @@ sudo kill -KILL $(pgrep -x picam)   # actually quit; bash loop relaunches in 3s
 
 Coming features (not yet shipped):
 
+- **`/control` settings drawer** — adjust ISO / shutter / AWB / resolution / RAW from the phone (currently only touchscreen)
 - **Histogram overlay** — luminance histogram in the viewfinder corner to verify exposure
 - **Focus peaking** — edge detection overlay on preview to confirm sharp focus through the eyepiece
-- **Screen brightness control** — dim the display further or sleep during long exposures
-- **Video playback** — currently videos show a first-frame thumbnail only; in-app playback is deferred (Slint has no native video widget)
+- **Screen brightness control** — dim the display further during long exposures
 
 ---
 

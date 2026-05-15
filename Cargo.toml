@@ -1,6 +1,6 @@
 [package]
 name = "picam"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 
 [[bin]]
@@ -40,7 +40,7 @@ and recording, live MJPEG/RTMP streaming, configurable via TOML. Runs under \
 the cage Wayland compositor with no desktop environment."""
 section = "graphics"
 priority = "optional"
-depends = "$auto, libcamera0.7, libjpeg62-turbo, ffmpeg, cage, rpicam-apps"
+depends = "$auto, libcamera0.7, libjpeg62-turbo, ffmpeg, cage, rpicam-apps, mpv"
 recommends = "raspi-config"
 assets = [
     ["target/release/picam",  "usr/bin/",                    "755"],
