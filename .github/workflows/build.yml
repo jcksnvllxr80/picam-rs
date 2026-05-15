@@ -27,6 +27,7 @@ jobs:
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
             git curl ca-certificates pkg-config build-essential \
             libcamera-dev libjpeg62-turbo-dev \
+            libfontconfig1-dev libxkbcommon-dev libwayland-dev \
             cmake ninja-build
 
       - name: Checkout
