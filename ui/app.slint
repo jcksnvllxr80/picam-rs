@@ -11,6 +11,21 @@ export struct GalleryItem {
     is-video: bool,
 }
 
+// ── Screen-sleep idle tracker ─────────────────────────────────────────────────
+// `ms-since-touch` increments every second via a Timer in AppWindow. Any
+// pointer-down event (caught by a back-layer TouchArea) calls Idle.touch()
+// which resets it. When it exceeds `sleep-after-ms` (set from the General-tab
+// timeout idx), the AppWindow shows a fullscreen black overlay; any touch on
+// it dismisses sleep. `sleep-after-ms == 0` disables the feature.
+global Idle {
+    in-out property <int>  ms-since-touch:  0;
+    in-out property <int>  sleep-after-ms:  0;
+    out property    <bool> sleeping:        sleep-after-ms > 0 && ms-since-touch >= sleep-after-ms;
+    public function touch() {
+        ms-since-touch = 0;
+    }
+}
+
 // ── Shared colours ────────────────────────────────────────────────────────────
 // Astro theme: monochrome red palette tuned for telescope eyepiece use.
 // Red light (>600nm) minimally activates rod cells, so the UI never wrecks
@@ -160,7 +175,22 @@ export component AppWindow inherits Window {
     in-out property <int>  self-timer-idx: 0;        // 0=off, 1=2s, 2=5s, 3=10s
     in-out property <int>  burst-count-idx: 0;       // 0=1, 1=3, 2=5, 3=10
     in-out property <bool> last-shot-enabled: true;
+    in-out property <int>  sleep-timeout-idx: 0;     // 0=off, 1=30s, 2=1min, 3=5min, 4=10min, 5=30min
     in property    <string> free-space-str: "—";
+
+    // Bridge the idx-based UI control to the Idle global's ms threshold.
+    function apply-sleep-idx() {
+        Idle.sleep-after-ms =
+            sleep-timeout-idx == 1 ?   30 * 1000 :
+            sleep-timeout-idx == 2 ?   60 * 1000 :
+            sleep-timeout-idx == 3 ?  5 * 60 * 1000 :
+            sleep-timeout-idx == 4 ? 10 * 60 * 1000 :
+            sleep-timeout-idx == 5 ? 30 * 60 * 1000 :
+            0;
+        Idle.ms-since-touch = 0;
+    }
+    init => { apply-sleep-idx(); }
+    changed sleep-timeout-idx => { apply-sleep-idx(); }
 
     // ── Streaming (Advanced tab — values come from config.toml) ───────────────
     in-out property <int>    stream-port: 8080;         // read-only display
@@ -194,6 +224,33 @@ export component AppWindow inherits Window {
     callback shutdown-system();
     callback reboot-system();
     callback restart-app();
+    callback sleeping-changed(bool);
+    callback apply-remote-settings();   // poked when /control posts a setting update
+
+    // Mirror Idle.sleeping into an out property so Rust can fire a callback on
+    // change (used to drive the backlight off when the screen sleeps).
+    out property <bool> sleeping: Idle.sleeping;
+    changed sleeping => { root.sleeping-changed(self.sleeping); }
+
+    // ── Idle/sleep machinery ──────────────────────────────────────────────────
+    // Tick the idle counter; pointer-event on the back-layer touch capturer
+    // resets it via Idle.touch(). When Idle.sleeping flips true, a fullscreen
+    // black overlay is shown over everything else.
+    Timer {
+        interval: 1s;
+        running: Idle.sleep-after-ms > 0 && !Idle.sleeping;
+        triggered => { Idle.ms-since-touch += 1000; }
+    }
+    // Back-layer pointer listener: fires for any pointer event in the window,
+    // even if a foreground TouchArea also handles it. This is how we detect
+    // "user touched something" without instrumenting every individual button.
+    back-touch := TouchArea {
+        x: 0; y: 0; width: 800px; height: 480px;
+        mouse-cursor: none;
+        pointer-event(e) => {
+            if (e.kind == PointerEventKind.down) { Idle.touch(); }
+        }
+    }
 
     // ── Pages ─────────────────────────────────────────────────────────────────
 
@@ -957,6 +1014,18 @@ export component AppWindow inherits Window {
                     }
                 }
 
+                // Screen sleep timeout — any tap on the dark screen wakes
+                SettingRow { label: "Sleep Timeout";
+                    HorizontalLayout {
+                        x: 180px; spacing: 6px; padding: 4px;
+                        for lbl[i] in ["Off", "30s", "1m", "5m", "10m", "30m"]: FlatBtn {
+                            label: lbl; active: root.sleep-timeout-idx == i; width: 70px;
+                            active-color: Theme.info;
+                            clicked => { root.sleep-timeout-idx = i; }
+                        }
+                    }
+                }
+
                 // Storage info (read-only)
                 SettingRow { label: "Storage Free";
                     Text {
@@ -1220,6 +1289,18 @@ export component AppWindow inherits Window {
                 active: root.current-page == Page.Power;
                 clicked => { root.current-page = Page.Power; }
             }
+        }
+    }
+
+    // ── Sleep overlay (top of z-order) ────────────────────────────────────────
+    // Covers everything when Idle.sleeping; any tap on it dismisses sleep.
+    if Idle.sleeping: Rectangle {
+        x: 0; y: 0; width: 800px; height: 480px;
+        background: #000000;
+        TouchArea {
+            mouse-cursor: none;
+            width: 100%; height: 100%;
+            clicked => { Idle.touch(); }
         }
     }
 }

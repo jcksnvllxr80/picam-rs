@@ -1,3 +1,4 @@
+mod backlight;
 mod camera;
 mod config;
 mod gallery;
@@ -81,6 +82,7 @@ fn main() {
     app.set_self_timer_idx (cfg.general.self_timer_idx  as i32);
     app.set_burst_count_idx(cfg.general.burst_count_idx as i32);
     app.set_last_shot_enabled(cfg.general.last_shot_enabled);
+    app.set_sleep_timeout_idx(cfg.general.sleep_timeout_idx as i32);
     app.set_stream_port    (cfg.stream.local_port as i32);
     app.set_push_url       (cfg.stream.push_url.clone().into());
 
@@ -522,6 +524,69 @@ fn main() {
                 Ok(img) => ui.set_gallery_preview_image(img),
                 Err(_)  => ui.set_gallery_preview_image(slint::Image::default()),
             }
+        });
+    }
+
+    // ── /control settings applier ─────────────────────────────────────────────
+    // The HTTP server posts a JSON patch (e.g. {"iso_idx":3,"ev":0.5}) to
+    // /api/settings; this closure ports each known key into the Slint UI's
+    // properties. The existing 500ms settings-sync thread then propagates
+    // them to the camera. One-way for now: writes via /control land in the
+    // touchscreen UI too.
+    {
+        let handle = handle.clone();
+        let applier: camera::SettingsApplier = Arc::new(move |patch: serde_json::Value| {
+            let h = handle.clone();
+            let _ = h.upgrade_in_event_loop(move |ui| {
+                if let Some(o) = patch.as_object() {
+                    if let Some(v) = o.get("iso_idx").and_then(|v| v.as_i64()) {
+                        ui.set_iso_idx(v as i32);
+                    }
+                    if let Some(v) = o.get("shutter_idx").and_then(|v| v.as_i64()) {
+                        ui.set_shutter_idx(v as i32);
+                    }
+                    if let Some(v) = o.get("awb_idx").and_then(|v| v.as_i64()) {
+                        ui.set_awb_idx(v as i32);
+                    }
+                    if let Some(v) = o.get("ev").and_then(|v| v.as_f64()) {
+                        ui.set_ev(v as f32);
+                    }
+                    if let Some(v) = o.get("zoom").and_then(|v| v.as_f64()) {
+                        ui.set_zoom(v as f32);
+                    }
+                    if let Some(v) = o.get("contrast").and_then(|v| v.as_f64()) {
+                        ui.set_contrast(v as f32);
+                    }
+                    if let Some(v) = o.get("saturation").and_then(|v| v.as_f64()) {
+                        ui.set_saturation(v as f32);
+                    }
+                    if let Some(v) = o.get("sharpness").and_then(|v| v.as_f64()) {
+                        ui.set_sharpness(v as f32);
+                    }
+                    if let Some(v) = o.get("brightness").and_then(|v| v.as_f64()) {
+                        ui.set_brightness(v as f32);
+                    }
+                }
+            });
+        });
+        cam.set_settings_applier(applier);
+    }
+
+    // ── Backlight off during screen sleep ─────────────────────────────────────
+    // Slint fires `sleeping-changed` whenever the screen-sleep state flips.
+    // We translate that into a brightness write to /sys/class/backlight.
+    // Detect once at startup; if the device isn't present (running off-Pi for
+    // dev) or we can't write to it, the closure is a no-op.
+    //
+    // Always force-on at startup. If a previous picam instance was killed
+    // while sleeping, the LEDs are still at 0 — nothing else writes max
+    // until the next sleep/wake cycle, so the screen would stay black for
+    // the user even though picam is healthy. Forcing on here recovers.
+    if let Some(backlight) = backlight::Backlight::detect() {
+        backlight.on();
+        let backlight = Arc::new(backlight);
+        app.on_sleeping_changed(move |sleeping| {
+            if sleeping { backlight.off(); } else { backlight.on(); }
         });
     }
 
