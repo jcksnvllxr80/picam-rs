@@ -1,0 +1,3 @@
+# Installed by picam-rs to /etc/sudoers.d/picam-power
+# Grants passwordless sudo for the power menu (Shutdown / Reboot).
+pi ALL=(ALL) NOPASSWD: /sbin/shutdown, /sbin/reboot

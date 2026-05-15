@@ -102,7 +102,29 @@ Versions used in development:
 
 ---
 
-## Build
+## Install (from prebuilt .deb — recommended)
+
+Every push to `main` triggers a GitHub Actions release with a built `.deb` attached:
+
+```bash
+# Replace <VERSION> with the latest release on the GitHub Releases page
+wget https://github.com/jcksnvllxr80/picam-rs/releases/latest/download/picam-rs_<VERSION>-1_arm64.deb
+sudo apt install ./picam-rs_<VERSION>-1_arm64.deb
+sudo reboot
+```
+
+The `.deb`'s postinst handles everything: installs the binary at `/usr/bin/picam`, configures passwordless sudo for the Power menu, sets up getty autologin on tty1, disables lightdm, and enables `picam.service`. After reboot the kiosk starts fullscreen.
+
+To uninstall:
+
+```bash
+sudo apt remove picam-rs       # keeps config files
+sudo apt purge picam-rs        # also removes /etc/sudoers.d/picam-power and getty override
+```
+
+---
+
+## Build from source
 
 ```bash
 git clone <repo-url> ~/picam-rs
@@ -112,11 +134,19 @@ cargo build --release
 
 > **First build:** ~25 minutes on a Pi 4 (2GB). It compiles the C++ libcamera wrapper (`src/camera_ffi.cpp` via the `cc` crate) plus the full Slint dependency tree. Subsequent builds are fast (a few minutes for Rust changes; ~10s for UI-only changes).
 
-The release binary lands at `target/release/picam`.
+The release binary lands at `target/release/picam`. To build a local `.deb`:
+
+```bash
+cargo install cargo-deb
+cargo deb
+# → target/debian/picam-rs_<ver>-1_arm64.deb
+```
 
 ---
 
-## Kiosk Setup
+## Kiosk Setup (manual — skip this if you installed from .deb)
+
+> The `.deb` postinst does steps 1–4 automatically. This section is only for source builds or for understanding what the package configures.
 
 ### 1. Passwordless sudo for power commands
 

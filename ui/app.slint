@@ -3,7 +3,7 @@ import { ScrollView } from "std-widgets.slint";
 export enum Page { Viewfinder, Settings, Gallery, Power }
 export enum CaptureMode { Photo, Video, Timelapse }
 export enum TlState { Idle, Running, Rendering }
-export enum SettingsTab { Capture, Image, Advanced, General }
+export enum SettingsTab { Capture, Image, Advanced, Stream, General }
 
 export struct GalleryItem {
     path: string,
@@ -29,22 +29,34 @@ global Theme {
 }
 
 // ── Small icon-text button used in nav bar ────────────────────────────────────
+// Icon is the dominant element — large glyph centered with the label below.
 component NavBtn inherits TouchArea {
+    in property <string> icon;
     in property <string> label;
-    in property <bool> active: false;
+    in property <bool>   active: false;
 
     width: 80px;
     height: 60px;
 
     Rectangle {
-        background: active ? #333333 : transparent;
+        background: active ? Theme.surface : transparent;
         border-radius: 6px;
-        Text {
-            text: label;
-            color: active ? Theme.text : Theme.dim;
-            font-size: active ? 13px : 12px;
-            horizontal-alignment: center;
-            vertical-alignment: center;
+        VerticalLayout {
+            alignment: center;
+            spacing: 0px;
+            Text {
+                text: icon;
+                color: active ? Theme.accent : Theme.text;
+                font-size: 28px;
+                horizontal-alignment: center;
+            }
+            Text {
+                text: label;
+                color: active ? Theme.text : Theme.dim;
+                font-size: 10px;
+                font-weight: active ? 700 : 400;
+                horizontal-alignment: center;
+            }
         }
     }
 }
@@ -148,6 +160,12 @@ export component AppWindow inherits Window {
     in-out property <bool> last-shot-enabled: true;
     in property    <string> free-space-str: "—";
 
+    // ── Streaming (Advanced tab — values come from config.toml) ───────────────
+    in-out property <int>    stream-port: 8080;         // read-only display
+    in-out property <string> push-url:    "";           // read-only display
+    in-out property <bool>   local-stream-active: false;
+    in-out property <bool>   push-stream-active:  false;
+
     // Last-shot review state (managed by Rust, displayed when enabled)
     in property    <bool>  show-last-shot: false;
     in property    <image> last-shot-image;
@@ -166,6 +184,9 @@ export component AppWindow inherits Window {
     callback delete-item(int);
     callback select-gallery-item(int);
     callback toggle-stream(bool);
+    callback toggle-local-stream(bool);
+    callback toggle-push-stream(bool);
+    callback reload-config();
     callback shutdown-system();
     callback reboot-system();
     callback restart-app();
@@ -496,7 +517,7 @@ export component AppWindow inherits Window {
                         Text {
                             text: "Capture";
                             color: Theme.text;
-                            font-size: 15px;
+                            font-size: 14px;
                             font-weight: root.settings-tab == SettingsTab.Capture ? 700 : 400;
                             horizontal-alignment: center; vertical-alignment: center;
                         }
@@ -510,7 +531,7 @@ export component AppWindow inherits Window {
                         Text {
                             text: "Image";
                             color: Theme.text;
-                            font-size: 15px;
+                            font-size: 14px;
                             font-weight: root.settings-tab == SettingsTab.Image ? 700 : 400;
                             horizontal-alignment: center; vertical-alignment: center;
                         }
@@ -524,7 +545,7 @@ export component AppWindow inherits Window {
                         Text {
                             text: "Advanced";
                             color: Theme.text;
-                            font-size: 15px;
+                            font-size: 14px;
                             font-weight: root.settings-tab == SettingsTab.Advanced ? 700 : 400;
                             horizontal-alignment: center; vertical-alignment: center;
                         }
@@ -533,12 +554,26 @@ export component AppWindow inherits Window {
                 }
                 TouchArea {
                     Rectangle {
+                        background: root.settings-tab == SettingsTab.Stream ? Theme.info : transparent;
+                        border-radius: 6px;
+                        Text {
+                            text: "Stream";
+                            color: Theme.text;
+                            font-size: 14px;
+                            font-weight: root.settings-tab == SettingsTab.Stream ? 700 : 400;
+                            horizontal-alignment: center; vertical-alignment: center;
+                        }
+                    }
+                    clicked => { root.settings-tab = SettingsTab.Stream; }
+                }
+                TouchArea {
+                    Rectangle {
                         background: root.settings-tab == SettingsTab.General ? Theme.info : transparent;
                         border-radius: 6px;
                         Text {
                             text: "General";
                             color: Theme.text;
-                            font-size: 15px;
+                            font-size: 14px;
                             font-weight: root.settings-tab == SettingsTab.General ? 700 : 400;
                             horizontal-alignment: center; vertical-alignment: center;
                         }
@@ -775,6 +810,81 @@ export component AppWindow inherits Window {
                             label: "ON"; active: root.raw-enabled;
                             active-color: Theme.warn; width: 80px;
                             clicked => { root.raw-enabled = true; }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── Stream tab ──
+        if root.settings-tab == SettingsTab.Stream: Rectangle {
+            x: 0; y: 56px; width: 800px; height: 364px;
+            background: transparent;
+
+            VerticalLayout {
+                x: 0; width: 800px;
+                spacing: 4px;
+                padding-left: 10px; padding-right: 10px;
+
+                // Local MJPEG HTTP server. Port comes from config.toml.
+                SettingRow { label: "HTTP Stream";
+                    HorizontalLayout {
+                        x: 180px; spacing: 6px; padding: 4px;
+                        FlatBtn {
+                            label: root.local-stream-active ? "STOP" : "START";
+                            active: root.local-stream-active;
+                            active-color: Theme.accent; width: 90px;
+                            clicked => { root.toggle-local-stream(!root.local-stream-active); }
+                        }
+                        Text {
+                            text: ":" + root.stream-port;
+                            color: Theme.text; font-size: 14px; width: 80px;
+                            vertical-alignment: center;
+                        }
+                        Text {
+                            text: root.local-stream-active ? "● live" : "○ idle";
+                            color: root.local-stream-active ? Theme.accent : Theme.dim;
+                            font-size: 13px;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+
+                // Push stream to a URL (RTMP / SRT / MPEG-TS).
+                SettingRow { label: "Push URL";
+                    HorizontalLayout {
+                        x: 180px; spacing: 6px; padding: 4px;
+                        FlatBtn {
+                            label: root.push-stream-active ? "STOP" : "START";
+                            active: root.push-stream-active;
+                            active-color: Theme.accent; width: 90px;
+                            clicked => { root.toggle-push-stream(!root.push-stream-active); }
+                        }
+                        Text {
+                            text: root.push-url == "" ? "(none — set in config)" : root.push-url;
+                            color: root.push-url == "" ? Theme.dim : Theme.text;
+                            font-size: 12px;
+                            vertical-alignment: center;
+                            horizontal-stretch: 1;
+                            overflow: elide;
+                        }
+                    }
+                }
+
+                // Reload config.toml (picks up port/URL changes without restart)
+                SettingRow { label: "Config";
+                    HorizontalLayout {
+                        x: 180px; spacing: 6px; padding: 4px;
+                        FlatBtn {
+                            label: "Reload";
+                            active: false;
+                            active-color: Theme.info; width: 120px;
+                            clicked => { root.reload-config(); }
+                        }
+                        Text {
+                            text: "~/.config/picam-rs/config.toml";
+                            color: Theme.dim; font-size: 11px;
+                            vertical-alignment: center;
                         }
                     }
                 }
@@ -1054,17 +1164,20 @@ export component AppWindow inherits Window {
             alignment: center;
 
             NavBtn {
-                label: "📷\nCamera";
+                icon:  "◉";
+                label: "Camera";
                 active: root.current-page == Page.Viewfinder;
                 clicked => { root.current-page = Page.Viewfinder; }
             }
             NavBtn {
-                label: "⚙\nSettings";
+                icon:  "⚙";
+                label: "Settings";
                 active: root.current-page == Page.Settings;
                 clicked => { root.current-page = Page.Settings; }
             }
             NavBtn {
-                label: "🖼\nGallery";
+                icon:  "▦";
+                label: "Gallery";
                 active: root.current-page == Page.Gallery;
                 clicked => {
                     root.gallery-sel = -1;
@@ -1072,7 +1185,8 @@ export component AppWindow inherits Window {
                 }
             }
             NavBtn {
-                label: "⏻\nPower";
+                icon:  "⏻";
+                label: "Power";
                 active: root.current-page == Page.Power;
                 clicked => { root.current-page = Page.Power; }
             }

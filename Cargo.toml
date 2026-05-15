@@ -12,6 +12,8 @@ slint = { version = "1", features = ["backend-winit-wayland"] }
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
 crossbeam-channel = "0.5"
 anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
 
 [build-dependencies]
 slint-build = "1"
@@ -21,3 +23,31 @@ cc = { version = "1", features = ["parallel"] }
 opt-level = 2
 lto = "thin"
 codegen-units = 4
+
+# ── Debian package metadata (consumed by `cargo deb`) ────────────────────────
+# Produces target/debian/picam-rs_<ver>-1_arm64.deb when run on aarch64. The
+# postinst script handles all the kiosk wiring (sudoers, autologin, systemd)
+# so a fresh Pi only needs: sudo apt install ./picam-rs_*.deb && sudo reboot.
+[package.metadata.deb]
+name = "picam-rs"
+maintainer = "Aaron Watkins <ac.watkins80@gmail.com>"
+copyright = "2026 Aaron Watkins"
+license-file = ["LICENSE", "0"]
+extended-description = """\
+Astrophotography-focused kiosk camera application for the Raspberry Pi 4. \
+Full-screen touchscreen UI built with Slint, dual-stream libcamera preview \
+and recording, live MJPEG/RTMP streaming, configurable via TOML. Runs under \
+the cage Wayland compositor with no desktop environment."""
+section = "graphics"
+priority = "optional"
+depends = "$auto, libcamera0.7, libjpeg62-turbo, ffmpeg, cage, rpicam-apps"
+recommends = "raspi-config"
+assets = [
+    ["target/release/picam",  "usr/bin/",                    "755"],
+    ["README.md",             "usr/share/doc/picam-rs/",     "644"],
+    ["setup/picam.service",   "lib/systemd/system/",         "644"],
+    ["setup/picam-power.sudoers", "usr/share/picam-rs/",     "644"],
+]
+maintainer-scripts = "debian/"
+systemd-units = { unit-name = "picam", enable = true, start = false, restart-after-upgrade = true }
+conf-files = ["/etc/sudoers.d/picam-power"]

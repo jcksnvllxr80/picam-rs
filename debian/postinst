@@ -1,0 +1,63 @@
+#!/bin/sh
+# picam-rs postinst — wire up the kiosk on first install.
+# Idempotent: safe to re-run on upgrades.
+set -e
+
+KIOSK_USER="${PICAM_USER:-pi}"
+SUDOERS_SRC="/usr/share/picam-rs/picam-power.sudoers"
+SUDOERS_DST="/etc/sudoers.d/picam-power"
+GETTY_OVERRIDE_DIR="/etc/systemd/system/getty@tty1.service.d"
+GETTY_OVERRIDE="${GETTY_OVERRIDE_DIR}/picam-autologin.conf"
+
+case "$1" in
+    configure)
+        # 1. Passwordless sudo for shutdown/reboot (used by the Power menu).
+        if [ -f "$SUDOERS_SRC" ]; then
+            install -m 0440 "$SUDOERS_SRC" "$SUDOERS_DST"
+        fi
+
+        # 2. getty autologin on tty1 — drops straight into the kiosk user's shell.
+        if id "$KIOSK_USER" >/dev/null 2>&1; then
+            mkdir -p "$GETTY_OVERRIDE_DIR"
+            cat > "$GETTY_OVERRIDE" <<EOF
+[Service]
+ExecStart=
+ExecStart=-/sbin/agetty --autologin ${KIOSK_USER} --noclear %I \$TERM
+EOF
+        else
+            echo "picam-rs: WARNING — user '${KIOSK_USER}' does not exist;" >&2
+            echo "  skipping getty autologin and systemd-service enablement." >&2
+            echo "  Set PICAM_USER=<username> and reinstall to fix." >&2
+        fi
+
+        # 3. Disable lightdm if it's present — the kiosk needs tty1.
+        if systemctl list-unit-files lightdm.service >/dev/null 2>&1; then
+            if systemctl is-enabled --quiet lightdm 2>/dev/null; then
+                systemctl disable --now lightdm.service || true
+                echo "picam-rs: disabled lightdm (was masking the kiosk on tty1)"
+            fi
+        fi
+
+        # 4. Reload systemd so getty override and picam.service are visible.
+        systemctl daemon-reload || true
+        systemctl enable getty@tty1.service >/dev/null 2>&1 || true
+
+        # picam.service itself is enabled by cargo-deb via the [package.metadata.deb]
+        # systemd-units stanza, so we don't need to enable it here.
+
+        echo ""
+        echo "picam-rs installed."
+        echo "  Reboot to start the kiosk:   sudo reboot"
+        echo "  Check service:               systemctl status picam"
+        echo "  Live preview HTTP stream:    http://<this-pi>:8080/"
+        echo "  Edit config:                 ~${KIOSK_USER}/.config/picam-rs/config.toml"
+        echo ""
+        ;;
+
+    abort-upgrade|abort-remove|abort-deconfigure)
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

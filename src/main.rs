@@ -1,5 +1,7 @@
 mod camera;
+mod config;
 mod gallery;
+mod stream;
 mod timelapse;
 
 use std::sync::Arc;
@@ -53,12 +55,54 @@ fn main() {
         std::env::set_var("WAYLAND_DISPLAY", "wayland-1");
     }
 
-    let cam = Arc::new(Camera::new());
+    let cfg = config::Config::load();
 
-    let tl = Arc::new(timelapse::Timelapse::new());
+    let cam = Arc::new(Camera::new());
+    let tl  = Arc::new(timelapse::Timelapse::new());
 
     let app    = AppWindow::new().expect("Slint init");
     let handle = app.as_weak();
+
+    // Apply config defaults to UI properties so the user's TOML is honored.
+    app.set_iso_idx        (cfg.camera.iso_idx     as i32);
+    app.set_shutter_idx    (cfg.camera.shutter_idx as i32);
+    app.set_awb_idx        (cfg.camera.awb_idx     as i32);
+    app.set_ev             (cfg.camera.ev);
+    app.set_contrast       (cfg.camera.contrast);
+    app.set_saturation     (cfg.camera.saturation);
+    app.set_sharpness      (cfg.camera.sharpness);
+    app.set_brightness     (cfg.camera.brightness);
+    app.set_zoom           (cfg.camera.zoom);
+    app.set_photo_res_idx  (cfg.capture.photo_res_idx as i32);
+    app.set_video_res_idx  (cfg.capture.video_res_idx as i32);
+    app.set_tl_res_idx     (cfg.capture.tl_res_idx    as i32);
+    app.set_raw_enabled    (cfg.capture.raw_enabled);
+    app.set_stream_enabled (cfg.capture.stream_enabled);
+    app.set_self_timer_idx (cfg.general.self_timer_idx  as i32);
+    app.set_burst_count_idx(cfg.general.burst_count_idx as i32);
+    app.set_last_shot_enabled(cfg.general.last_shot_enabled);
+    app.set_stream_port    (cfg.stream.local_port as i32);
+    app.set_push_url       (cfg.stream.push_url.clone().into());
+
+    // Apply startup defaults to the camera itself
+    if !cfg.capture.stream_enabled {
+        cam.set_stream_enabled(false);
+    }
+
+    // Auto-start streams if config says so
+    if cfg.stream.local_enabled {
+        match cam.set_local_stream(cfg.stream.local_port) {
+            Ok(()) => app.set_local_stream_active(true),
+            Err(e) => eprintln!("[stream] local auto-start failed: {e:#}"),
+        }
+    }
+    if cfg.stream.push_enabled && !cfg.stream.push_url.is_empty() {
+        let (w, h) = (800u32, 480u32); // preview stream resolution
+        match cam.set_push_stream(&cfg.stream.push_url, w, h) {
+            Ok(()) => app.set_push_stream_active(true),
+            Err(e) => eprintln!("[stream] push auto-start failed: {e:#}"),
+        }
+    }
 
     // ── Frame pump: camera thread → Slint event loop ──────────────────────────
     {
@@ -345,6 +389,76 @@ fn main() {
         let cam_ref = Arc::clone(&cam);
         app.on_toggle_stream(move |on| {
             cam_ref.set_stream_enabled(on);
+        });
+    }
+
+    // ── Local MJPEG HTTP server toggle ────────────────────────────────────────
+    {
+        let cam_ref = Arc::clone(&cam);
+        let handle  = handle.clone();
+        app.on_toggle_local_stream(move |on| {
+            if on {
+                let port = handle.upgrade().map(|ui| ui.get_stream_port() as u16).unwrap_or(8080);
+                match cam_ref.set_local_stream(port) {
+                    Ok(()) => {
+                        let _ = handle.upgrade_in_event_loop(|ui| ui.set_local_stream_active(true));
+                    }
+                    Err(e) => {
+                        eprintln!("[stream] local start failed: {e:#}");
+                        let _ = handle.upgrade_in_event_loop(|ui| ui.set_local_stream_active(false));
+                    }
+                }
+            } else {
+                cam_ref.clear_local_stream();
+                let _ = handle.upgrade_in_event_loop(|ui| ui.set_local_stream_active(false));
+            }
+        });
+    }
+
+    // ── Push stream toggle ────────────────────────────────────────────────────
+    {
+        let cam_ref = Arc::clone(&cam);
+        let handle  = handle.clone();
+        app.on_toggle_push_stream(move |on| {
+            if on {
+                let url = handle.upgrade().map(|ui| ui.get_push_url().to_string()).unwrap_or_default();
+                if url.is_empty() {
+                    eprintln!("[stream] push: no URL configured");
+                    let _ = handle.upgrade_in_event_loop(|ui| ui.set_push_stream_active(false));
+                    return;
+                }
+                match cam_ref.set_push_stream(&url, 800, 480) {
+                    Ok(()) => {
+                        let _ = handle.upgrade_in_event_loop(|ui| ui.set_push_stream_active(true));
+                    }
+                    Err(e) => {
+                        eprintln!("[stream] push start failed: {e:#}");
+                        let _ = handle.upgrade_in_event_loop(|ui| ui.set_push_stream_active(false));
+                    }
+                }
+            } else {
+                cam_ref.clear_push_stream();
+                let _ = handle.upgrade_in_event_loop(|ui| ui.set_push_stream_active(false));
+            }
+        });
+    }
+
+    // ── Reload config (re-reads ~/.config/picam-rs/config.toml) ───────────────
+    {
+        let cam_ref = Arc::clone(&cam);
+        let handle  = handle.clone();
+        app.on_reload_config(move || {
+            let new_cfg = config::Config::load();
+            // Apply only the stream-related properties (camera/capture/general
+            // could trample in-flight UI state, so we leave those alone).
+            let _ = handle.upgrade_in_event_loop(move |ui| {
+                ui.set_stream_port(new_cfg.stream.local_port as i32);
+                ui.set_push_url(new_cfg.stream.push_url.clone().into());
+            });
+            // If a stream is currently active and the port/URL changed, the
+            // user should toggle off+on to pick up the new value. Document
+            // this rather than silently restart streams behind their back.
+            let _ = cam_ref; // keeps reference alive
         });
     }
 

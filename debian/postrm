@@ -1,0 +1,25 @@
+#!/bin/sh
+# picam-rs postrm — undo the kiosk wiring on full purge.
+# On simple `remove`, we leave the user's bash_profile / getty override alone
+# in case they're reinstalling. Only purge tears down everything.
+set -e
+
+GETTY_OVERRIDE_DIR="/etc/systemd/system/getty@tty1.service.d"
+GETTY_OVERRIDE="${GETTY_OVERRIDE_DIR}/picam-autologin.conf"
+
+case "$1" in
+    purge)
+        rm -f /etc/sudoers.d/picam-power
+        rm -f "$GETTY_OVERRIDE"
+        # Try to clean the directory if it's now empty
+        rmdir "$GETTY_OVERRIDE_DIR" 2>/dev/null || true
+        systemctl daemon-reload || true
+        ;;
+
+    remove|upgrade|failed-upgrade|abort-install|abort-upgrade|disappear)
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0
