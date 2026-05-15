@@ -13,6 +13,7 @@ image = { version = "0.25", default-features = false, features = ["jpeg"] }
 crossbeam-channel = "0.5"
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 toml = "0.8"
 
 [build-dependencies]
@@ -43,10 +44,11 @@ priority = "optional"
 depends = "$auto, libcamera0.7, libjpeg62-turbo, ffmpeg, cage, rpicam-apps, mpv"
 recommends = "raspi-config"
 assets = [
-    ["target/release/picam",  "usr/bin/",                    "755"],
-    ["README.md",             "usr/share/doc/picam-rs/",     "644"],
-    ["setup/picam.service",   "lib/systemd/system/",         "644"],
-    ["setup/picam-power.sudoers", "usr/share/picam-rs/",     "644"],
+    ["target/release/picam",            "usr/bin/",                  "755"],
+    ["README.md",                       "usr/share/doc/picam-rs/",   "644"],
+    ["setup/picam.service",             "lib/systemd/system/",       "644"],
+    ["setup/picam-power.sudoers",       "usr/share/picam-rs/",       "644"],
+    ["setup/99-picam-backlight.rules",  "lib/udev/rules.d/",         "644"],
 ]
 maintainer-scripts = "debian/"
 systemd-units = { unit-name = "picam", enable = true, start = false, restart-after-upgrade = true }

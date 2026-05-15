@@ -69,6 +69,11 @@ PY
         systemctl daemon-reload || true
         systemctl enable getty@tty1.service >/dev/null 2>&1 || true
 
+        # 6. Apply the backlight udev rule immediately (it auto-applies on
+        # next boot too, but doing it now spares the user a reboot).
+        udevadm control --reload-rules 2>/dev/null || true
+        udevadm trigger --subsystem-match=backlight 2>/dev/null || true
+
         # picam.service itself is enabled by cargo-deb via the [package.metadata.deb]
         # systemd-units stanza, so we don't need to enable it here.
 

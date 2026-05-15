@@ -1,0 +1,4 @@
+# Installed by picam-rs to /etc/udev/rules.d/.
+# Lets the kiosk user write to /sys/class/backlight/*/brightness without sudo
+# so the screen-sleep feature can turn the touchscreen LEDs on and off.
+SUBSYSTEM=="backlight", ACTION=="add|change", RUN+="/bin/chmod 0666 /sys/class/backlight/%k/brightness"

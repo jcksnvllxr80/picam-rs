@@ -53,6 +53,7 @@ The entire UI is a monochrome red palette to preserve dark adaptation; the scree
 - Point any phone or laptop browser at `http://<pi-host>:8080/control` for a touch-optimised remote control
 - IBM Plex Mono monospace UI on the same astro-red palette as the touchscreen
 - Live preview, mode selector (Photo / Video), capture / record buttons with progress feedback
+- **Settings drawer** — adjust ISO, Shutter, AWB, EV, Zoom, Contrast, Saturation, Sharpness, Brightness from the phone. Changes sync to the touchscreen UI and back to the camera within 500ms
 - Gallery drawer: thumbnail grid, fullscreen lightbox (image or video), delete with confirmation
 - Tapping a thumbnail triggers the browser Fullscreen API — no address bar, rotation-aware
 - HTTP/MJPEG also served at `/stream` for VLC, OBS, ffmpeg, or any other MJPEG consumer
@@ -272,6 +273,8 @@ The control page polls a small JSON API for state and posts back capture command
 | `GET` | `/api/gallery` | — | `[{path, name, is_video}, ...]` |
 | `GET` | `/api/gallery/file` | `?path=...` | File bytes with correct Content-Type |
 | `DELETE` | `/api/gallery/file` | `?path=...` | `{ok}` — also removes the `.thumb.jpg` sidecar |
+| `GET` | `/api/settings` | — | `{iso_idx, shutter_idx, awb_idx, ev, zoom, contrast, saturation, sharpness, brightness}` |
+| `POST` | `/api/settings` | JSON patch (any subset of those keys) | `{ok}` — applied via UI handle, propagates to camera within 500ms |
 
 The server requires *path validity* against `gallery::scan()` — any request for a path outside `/home/pi/Pictures/picam`, `/home/pi/Videos/picam`, or `/home/pi/Pictures/timelapse` gets a 404 even if the file exists. URL-percent-encoded paths are decoded server-side.
 
@@ -294,6 +297,23 @@ Most settings are applied as libcamera controls on the next queued request (no r
 | Sharpness | `Sharpness` | 0.0–2.0 |
 | Brightness | `Brightness` | −1.0 to +1.0 |
 | Zoom | `ScalerCrop` (sensor rectangle) | 1×–4× (centre crop) |
+| Auto-exposure toggle | `AeEnable` | auto-driven: `false` whenever the user manually sets ISO or Shutter, `true` otherwise |
+
+**How control persistence works.** Two libcamera gotchas dictate the C++ wrapper's design:
+
+1. `Request::reuse(ReuseBuffers)` clears all controls on a recycled request — setting controls *before* the reuse means they're immediately wiped.
+2. libcamera does not auto-propagate per-frame controls (`AnalogueGain`, `ExposureTime`, `Contrast`, …) to subsequent requests. Setting them once means they apply to a single frame and then revert.
+
+So the wrapper stores the desired control state in atomic fields on `PicamHandle`. Every `requestCompleted` callback:
+
+1. Delivers the buffered frame to the Rust callback.
+2. Calls `req->reuse(ReuseBuffers)` to recycle the request.
+3. Calls `apply_controls(req)` which reads the atomic state and writes a fresh `ControlList`.
+4. Re-queues the request.
+
+Auto-exposure on/off is driven by `controls::AeEnable` (the canonical, well-supported AE toggle). The newer `AnalogueGainMode` / `ExposureTimeMode` controls exist in libcamera 0.7.1's headers but the RPi IPA doesn't yet honor them — picam tried using them first and silently no-op'd.
+
+**Long-exposure preview cap.** The dual-stream libcamera session uses one sensor exposure for both the preview and record streams. A 60-second user-set shutter means every preview frame takes 60 seconds, which freezes the live view. picam therefore caps the *preview* shutter at 1 second — anything longer (deep-sky exposures) keeps the preview running at a reasonable framerate. Actual still capture (`rpicam-still` subprocess) uses the full unclamped user value via `--shutter`, so the photo on disk is the real 60-second / 120-second exposure you asked for.
 
 ---
 
@@ -312,6 +332,10 @@ The Settings page is organised into five tabs so each fits on the 480px screen w
 ### Screen sleep
 
 `General → Sleep Timeout` blanks the screen after N seconds of touch inactivity. Any tap wakes it. Powered by a Slint `pointer-event` back-layer that resets a global idle counter without instrumenting every individual button — same trick that hides the cursor (`mouse-cursor: none`).
+
+**Backlight off:** when the screen sleeps, picam writes `0` to `/sys/class/backlight/*/brightness` so the touchscreen LEDs cut power entirely — pitch black, no stray light during long astrophoto exposures. The wake-up tap restores `max_brightness`. A udev rule installed by the `.deb` chmods the sysfs path to 0666 so the kiosk user can write to it without sudo.
+
+If picam is killed while the screen is asleep, the LEDs stay dark — nothing wrote `max_brightness` back. The next picam launch always forces brightness back to max on startup, so the cage relaunch loop (or a manual `sudo systemctl restart picam`) recovers automatically. As a last resort: `echo 255 | sudo tee /sys/class/backlight/*/brightness`.
 
 ---
 
@@ -392,10 +416,9 @@ sudo kill -KILL $(pgrep -x picam)   # actually quit; bash loop relaunches in 3s
 
 Coming features (not yet shipped):
 
-- **`/control` settings drawer** — adjust ISO / shutter / AWB / resolution / RAW from the phone (currently only touchscreen)
 - **Histogram overlay** — luminance histogram in the viewfinder corner to verify exposure
 - **Focus peaking** — edge detection overlay on preview to confirm sharp focus through the eyepiece
-- **Screen brightness control** — dim the display further during long exposures
+- **`/control` Advanced/General settings** — currently the web companion's settings drawer exposes the Capture and Image tabs; resolution, RAW, self-timer, burst, sleep timeout still touchscreen-only
 
 ---
 

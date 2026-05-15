@@ -245,6 +245,11 @@ fn nv12_to_rgba(nv12: &[u8], width: u32, height: u32) -> Vec<u8> {
 
 // ── Camera ────────────────────────────────────────────────────────────────────
 
+/// Callback registered by main.rs that applies a JSON settings patch to the
+/// Slint UI (via upgrade_in_event_loop). The /control HTTP server invokes this
+/// when it receives a POST to /api/settings.
+pub type SettingsApplier = Arc<dyn Fn(serde_json::Value) + Send + Sync>;
+
 pub struct Camera {
     pub settings: Arc<Mutex<CameraSettings>>,
     pub frame_rx: Receiver<CameraEvent>,
@@ -259,6 +264,8 @@ pub struct Camera {
     // Optional live stream sinks. Set/cleared by main.rs as the user toggles.
     pub local_stream: Arc<Mutex<Option<Arc<crate::stream::LocalStream>>>>,
     pub push_stream:  Arc<Mutex<Option<crate::stream::PushStream>>>,
+    /// /control settings applier — set once at startup by main.rs.
+    pub settings_applier: Arc<Mutex<Option<SettingsApplier>>>,
     // keeps callback context alive for the lifetime of the camera
     _ctx:         Box<CallbackCtx>,
 }
@@ -372,8 +379,13 @@ impl Camera {
             stream_enabled: Arc::new(AtomicBool::new(true)),
             local_stream,
             push_stream,
+            settings_applier: Arc::new(Mutex::new(None)),
             _ctx: ctx,
         }
+    }
+
+    pub fn set_settings_applier(&self, applier: SettingsApplier) {
+        *self.settings_applier.lock().unwrap() = Some(applier);
     }
 
     pub fn set_stream_enabled(&self, on: bool) {

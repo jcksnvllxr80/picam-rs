@@ -224,6 +224,13 @@ export component AppWindow inherits Window {
     callback shutdown-system();
     callback reboot-system();
     callback restart-app();
+    callback sleeping-changed(bool);
+    callback apply-remote-settings();   // poked when /control posts a setting update
+
+    // Mirror Idle.sleeping into an out property so Rust can fire a callback on
+    // change (used to drive the backlight off when the screen sleeps).
+    out property <bool> sleeping: Idle.sleeping;
+    changed sleeping => { root.sleeping-changed(self.sleeping); }
 
     // ── Idle/sleep machinery ──────────────────────────────────────────────────
     // Tick the idle counter; pointer-event on the back-layer touch capturer
