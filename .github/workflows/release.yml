@@ -1,0 +1,97 @@
+name: release
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: write   # needed to create releases
+
+jobs:
+  release:
+    name: Build and release .deb
+    runs-on: ubuntu-24.04-arm
+    container:
+      image: debian:trixie-slim
+
+    steps:
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            git curl ca-certificates pkg-config build-essential \
+            libcamera-dev libjpeg62-turbo-dev \
+            cmake ninja-build jq
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # we want full history to derive version info
+
+      - name: Mark workspace safe for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Install Rust toolchain
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain stable --profile minimal --no-modify-path
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: aarch64-trixie
+
+      - name: Compute release metadata
+        id: meta
+        run: |
+          CARGO_VER=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          DATE=$(date -u +%Y%m%d)
+          TAG="v${CARGO_VER}-${DATE}-${SHORT_SHA}"
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "version=$CARGO_VER" >> $GITHUB_OUTPUT
+          echo "short_sha=$SHORT_SHA" >> $GITHUB_OUTPUT
+          echo "TAG_NAME=$TAG" >> $GITHUB_ENV
+          echo "Release tag: $TAG"
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Run tests
+        run: cargo test --release --locked
+
+      - name: Install cargo-deb
+        run: cargo install cargo-deb --locked
+
+      - name: Build .deb package
+        run: cargo deb --no-build --no-strip
+
+      - name: List built .debs
+        run: ls -la target/debian/
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: "Build ${{ steps.meta.outputs.version }} (${{ steps.meta.outputs.short_sha }})"
+          body: |
+            Automated build from `${{ github.ref_name }}` @ `${{ github.sha }}`.
+
+            ## Install on a Raspberry Pi 4 (64-bit Debian Trixie)
+
+            ```bash
+            wget https://github.com/${{ github.repository }}/releases/download/${{ steps.meta.outputs.tag }}/picam-rs_${{ steps.meta.outputs.version }}-1_arm64.deb
+            sudo apt install ./picam-rs_${{ steps.meta.outputs.version }}-1_arm64.deb
+            sudo reboot
+            ```
+
+            The package installs the binary at `/usr/bin/picam`, configures kiosk
+            autologin on tty1, sets up the systemd service, and grants passwordless
+            sudo for shutdown/reboot. After reboot, the camera UI starts fullscreen.
+
+            See the full README at https://github.com/${{ github.repository }}/blob/main/README.md
+          files: target/debian/*.deb
+          fail_on_unmatched_files: true
+          generate_release_notes: true

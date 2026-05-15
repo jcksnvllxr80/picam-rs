@@ -1,5 +1,5 @@
 [Unit]
-Description=PiCam Rust kiosk
+Description=picam-rs astrophotography kiosk
 After=graphical.target systemd-logind.service
 
 [Service]
@@ -14,15 +14,12 @@ StandardError=journal
 Environment=XDG_RUNTIME_DIR=/run/user/1000
 Environment=HOME=/home/pi
 
-# cage creates a Wayland compositor and runs our app fullscreen inside it.
-# -s = launch app immediately, no idle-inhibit overhead
-ExecStart=/usr/bin/cage -s -- /home/pi/picam-rs/target/release/picam
+# cage creates a Wayland compositor and runs picam fullscreen inside it.
+# -s = launch app immediately, no idle-inhibit overhead.
+ExecStart=/usr/bin/cage -s -- /usr/bin/picam
 
 Restart=on-failure
 RestartSec=3
-
-# Allow sudo for shutdown/reboot without password
-# (add 'pi ALL=(ALL) NOPASSWD: /sbin/shutdown, /sbin/reboot' in /etc/sudoers.d/picam)
 
 [Install]
 WantedBy=multi-user.target

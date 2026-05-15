@@ -1,0 +1,64 @@
+name: build
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+    branches: ['**']
+  workflow_dispatch:
+
+# Cancel in-progress runs on the same ref so a fresh push supersedes the old
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build (aarch64, Debian Trixie)
+    runs-on: ubuntu-24.04-arm
+    # Run inside Debian Trixie so libcamera ABI matches the Pi target exactly
+    container:
+      image: debian:trixie-slim
+
+    steps:
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            git curl ca-certificates pkg-config build-essential \
+            libcamera-dev libjpeg62-turbo-dev \
+            cmake ninja-build
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain stable --profile minimal --no-modify-path
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: aarch64-trixie
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Run tests
+        run: cargo test --release --locked
+
+      - name: Install cargo-deb
+        run: cargo install cargo-deb --locked
+
+      - name: Build .deb package
+        run: cargo deb --no-build --no-strip
+
+      - name: Upload .deb artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: picam-rs-deb-${{ github.sha }}
+          path: target/debian/*.deb
+          if-no-files-found: error
+          retention-days: 14
