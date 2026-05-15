@@ -1,6 +1,8 @@
 # picam-rs
 
-A kiosk camera application for the Raspberry Pi 4, written in Rust. Provides a full-screen touchscreen UI (Slint) with live preview, photo capture, 1080p video recording, timelapse, and a gallery. Runs under the `cage` Wayland compositor with no desktop environment.
+An astrophotography-focused kiosk camera application for the Raspberry Pi 4, written in Rust. Built specifically for telescope eyepiece imaging — a Pi 4 sits at the telescope with the official 7" touchscreen, you frame and capture through the eyepiece.
+
+The entire UI is a monochrome red palette to preserve dark adaptation; the screen never emits anything that would wreck the rod-cell vision you need for observing through the eyepiece. Runs full-screen under the `cage` Wayland compositor — no desktop, no menu bars, just the camera.
 
 ---
 
@@ -17,15 +19,52 @@ A kiosk camera application for the Raspberry Pi 4, written in Rust. Provides a f
 
 ## Features
 
-- Live preview at 25 fps — NV12 frames delivered directly from libcamera, converted to RGBA in Rust, no MJPEG round-trip
-- Simultaneous preview and 1080p video recording via dual libcamera streams (lores 800×480 for preview, main 1920×1080 for recording)
-- Video recorded as H264 MP4 — NV12 frames piped in real-time to ffmpeg, file is ready immediately when recording stops
-- Photo capture at full 12MP (4056×3040) via `rpicam-still`
-- Timelapse with configurable interval and duration; ffmpeg renders JPEG frames to MP4
-- Gallery: browse and delete photos and videos
-- Camera controls: ISO, Shutter Speed, AWB Mode, EV, Contrast, Saturation, Sharpness, Brightness, Zoom (1×–4× via ScalerCrop)
-- Power menu: Shutdown, Reboot, Restart App
-- True kiosk: `cage` compositor, getty autologin, `~/.bash_profile` cage launch loop — no desktop required
+**Astrophotography essentials**
+
+- Long-exposure shutter range from 1/4000s up to 120s for deep-sky imaging
+- RAW (DNG) capture toggle saves alongside JPEG for proper post-processing
+- Self-timer (Off / 2s / 5s / 10s) eliminates touch-induced vibration
+- Burst mode (1 / 3 / 5 / 10 shots) for picking sharpest frames when seeing is unsteady
+- Live preview while recording video — dual libcamera streams, no pipeline interruption
+
+**Capture modes**
+
+- Photo: 12MP / 8MP / 5MP / FHD via `rpicam-still`, full resolution control
+- Video: 1080p / 720p / 480p H264 MP4, ffmpeg-scaled output
+- Timelapse: configurable interval (1s–5min) and duration (30s–2h), ffmpeg renders to MP4
+
+**Live preview**
+
+- 25 fps NV12 direct from libcamera, NV12→RGBA converted on a worker thread (libcamera pipeline never blocks)
+- Stream on/off toggle saves CPU when actively imaging (zero-CPU idle mode)
+- 180° rotation handled in software via libcamera `Orientation::Rotate180`
+
+**Gallery**
+
+- Photo full-screen preview by tapping any item
+- Video first-frame thumbnail extracted by ffmpeg at recording stop
+- Delete (also removes the `.thumb.jpg` sidecar)
+- Newest first
+
+**UX**
+
+- Red astro theme — no white, blue, or green anywhere in the UI
+- Tabbed Settings (Capture / Image / Advanced / General)
+- Last-shot review thumbnail flashes for 2s after capture (toggleable)
+- Storage-free indicator in the General tab
+- Hold-to-confirm Shutdown and Reboot (1.5s) — protects against stray taps during imaging
+- Power menu: Shutdown / Reboot / Restart App
+
+**Camera tuning controls**
+
+- ISO, Shutter, AWB, Exposure Value, Zoom (1×–4× via `ScalerCrop`)
+- Contrast, Saturation, Sharpness, Brightness
+- Settings pushed to libcamera every 500ms; applied without restarting the preview
+
+**True kiosk**
+
+- `cage` compositor, getty autologin, `~/.bash_profile` cage launch loop — no desktop required
+- App-exit auto-relaunch via the bash loop (after 3-second pause)
 
 ---
 
@@ -57,7 +96,7 @@ Versions used in development:
 | Rust (stable) | 1.95 |
 | Slint | 1.16 |
 | libcamera | 0.7.1 |
-| rpicam-apps | system package (for photo capture) |
+| rpicam-apps | system package (for photo/timelapse capture) |
 | ffmpeg | system package |
 | cage | 0.2 |
 
@@ -71,9 +110,9 @@ cd ~/picam-rs
 cargo build --release
 ```
 
-> **Note:** The first build compiles the C++ libcamera wrapper (`src/camera_ffi.cpp` via the `cc` crate) plus all Rust and Slint dependencies. On a Pi 4 (2GB), expect roughly **25 minutes**. Incremental builds are fast.
+> **First build:** ~25 minutes on a Pi 4 (2GB). It compiles the C++ libcamera wrapper (`src/camera_ffi.cpp` via the `cc` crate) plus the full Slint dependency tree. Subsequent builds are fast (a few minutes for Rust changes; ~10s for UI-only changes).
 
-The release binary is placed at `target/release/picam`.
+The release binary lands at `target/release/picam`.
 
 ---
 
@@ -118,43 +157,59 @@ fi
 EOF
 ```
 
-On next boot, `getty` logs in `pi` automatically, `~/.bash_profile` launches `cage`, and `cage` runs the app fullscreen. If the app exits (crash or "Restart App"), the loop relaunches it after 3 seconds. There is no desktop environment involved.
+On next boot, `getty` logs in `pi` automatically, `~/.bash_profile` launches `cage`, and `cage` runs the app fullscreen. If the app exits (crash or "Restart App"), the loop relaunches it after 3 seconds. No desktop environment involved.
 
 ---
 
 ## How It Works
 
-### Preview
+### Preview pipeline
 
-libcamera opens two concurrent streams when the app starts:
+libcamera opens two concurrent streams at startup:
 
 - **lores** (800×480, NV12) — delivered to the Rust preview callback at 25 fps
 - **main** (1920×1080, NV12) — delivered to the Rust record callback only when recording is active
 
-The C++ wrapper (`src/camera_ffi.cpp`) handles libcamera initialisation, buffer allocation, request queuing, and completion callbacks. The Rust layer converts NV12 frames to RGBA8 and sends them to the Slint event loop via a bounded channel.
+The C++ wrapper (`src/camera_ffi.cpp`) handles libcamera initialisation, buffer allocation via `FrameBufferAllocator`, dma-buf mmap, request queuing, and the `requestCompleted` signal. The Rust callbacks on the libcamera completion thread do only fast work — memcpy of the NV12 bytes into an owned `Vec<u8>`, then `try_send` on a bounded channel.
 
-### Video Recording
+A dedicated **`nv12-rgba` worker thread** in Rust pulls NV12 frames off that channel, converts them to RGBA8, and pushes the RGBA into another bounded channel feeding the Slint event loop. This keeps the libcamera pipeline from ever being blocked by conversion work — if the worker can't keep up, frames drop naturally at the channel boundaries rather than backpressuring the camera.
 
-When recording starts, an ffmpeg child process is spawned with a raw NV12 pipe as input:
+Architecturally:
 
 ```
-ffmpeg -f rawvideo -pix_fmt nv12 -s 1920x1080 -r 25 -i pipe:0 -c:v libx264 -preset fast output.mp4
+libcamera completion thread          worker thread              Slint event loop
+   on_preview_frame()       →   nv12-rgba (convert)    →    frame-pump (display)
+   memcpy + try_send             ~30% of one core           draws preview
 ```
 
-Each main-stream frame is written directly to the pipe. The preview continues uninterrupted. When recording stops, the pipe is closed and ffmpeg finalises the MP4 immediately — no post-processing step.
+### Video recording
 
-### Photo Capture
+When recording starts, an ffmpeg child process is spawned with a raw NV12 pipe as input. Each main-stream frame is written directly to the pipe in the libcamera callback:
 
-Still photos use `rpicam-still` for full 12MP resolution (4056×3040). The libcamera preview streams are briefly paused (~200ms) to release the camera resource, `rpicam-still` runs, then streaming resumes.
+```
+ffmpeg -y -f rawvideo -pix_fmt nv12 -s 1920x1080 -r 25 -i pipe:0 \
+       -vf scale=W:H \
+       -c:v libx264 -preset fast -pix_fmt yuv420p output.mp4
+```
 
-### Camera Settings
+The `-vf scale=W:H` filter is added only when the selected output resolution differs from 1080p (libcamera always streams at 1080p internally). Preview never pauses during recording.
 
-Settings are applied as libcamera controls on the next queued request (no subprocess restart needed):
+When recording stops, the stdin pipe is closed and ffmpeg finalises the MP4 immediately — no post-processing pass. A second ffmpeg invocation extracts a first-frame `<name>.thumb.jpg` for the gallery preview.
+
+### Photo capture
+
+Still photos use `rpicam-still` for full 12MP resolution. Because libcamera holds the camera pipeline handler exclusively, the in-process libcamera session must fully release the camera before `rpicam-still` can acquire it. `picam_pause` therefore does a complete teardown — stop streams, `munmap` all buffers, drop the FrameBufferAllocator and Request objects, then `camera->release()`. `picam_resume` rebuilds everything on the way back: `acquire()` → `configure()` → reallocate buffers → re-mmap → rebuild requests → `start()` → re-queue. Total round-trip is roughly 500–800ms.
+
+For long exposures, `rpicam-still --timeout` is padded to exceed the shutter length (capture would otherwise be cut short).
+
+### Capture settings table
+
+Most settings are applied as libcamera controls on the next queued request (no restart needed):
 
 | Setting | libcamera control | Range |
 |---------|------------------|-------|
 | ISO | `AnalogueGain` (gain = ISO/100) | Auto, 100–3200 |
-| Shutter speed | `ExposureTime` (microseconds) | Auto, 1/4000s–1s |
+| Shutter speed | `ExposureTime` (microseconds) | Auto, 1/4000s–120s |
 | White balance | `AwbMode` | auto, incandescent, tungsten, fluorescent, indoor, daylight, cloudy |
 | Exposure compensation | `ExposureValue` | −4.0 to +4.0 |
 | Contrast | `Contrast` | 0.0–2.0 |
@@ -163,7 +218,18 @@ Settings are applied as libcamera controls on the next queued request (no subpro
 | Brightness | `Brightness` | −1.0 to +1.0 |
 | Zoom | `ScalerCrop` (sensor rectangle) | 1×–4× (centre crop) |
 
-Settings are read from the Slint UI and pushed to the camera every 500ms, applied without restarting the preview.
+---
+
+## Settings UI
+
+The Settings page is organised into four tabs so each fits on the 480px screen without scrolling:
+
+| Tab | Contents |
+|-----|----------|
+| **Capture** | ISO, Shutter (two rows — short and long exposures), AWB, EV, Zoom |
+| **Image** | Contrast, Saturation, Sharpness, Brightness |
+| **Advanced** | Live Preview on/off, Photo Res, Video Res, TL Res, RAW (DNG) capture |
+| **General** | Self-Timer, Burst, Last-Shot Review, Storage Free |
 
 ---
 
@@ -172,33 +238,35 @@ Settings are read from the Slint UI and pushed to the camera every 500ms, applie
 ```
 picam-rs/
 ├── build.rs                  # Slint compiler + cc crate compiles camera_ffi.cpp
-├── Cargo.toml                # Dependencies: slint, crossbeam-channel, anyhow; build: slint-build, cc
+├── Cargo.toml                # Deps: slint, crossbeam-channel, anyhow; build-deps: slint-build, cc
 ├── Cargo.lock
 ├── README.md
 ├── .gitignore
 ├── src/
-│   ├── main.rs               # Slint event loop, UI callbacks, thread management
-│   ├── camera.rs             # Rust FFI bindings, NV12→RGBA, ffmpeg pipe recording
+│   ├── main.rs               # Slint event loop, UI callbacks, worker threads
+│   ├── camera.rs             # Rust FFI bindings, NV12→RGBA worker, capture orchestration
 │   ├── camera_ffi.h          # C header: PicamHandle API
 │   ├── camera_ffi.cpp        # C++ libcamera wrapper (dual-stream, controls, pause/resume)
-│   ├── gallery.rs            # File scanning and deletion
+│   ├── gallery.rs            # File scanning, deletion (with thumbnail cleanup)
 │   └── timelapse.rs          # Timelapse scheduling + ffmpeg MP4 render
 ├── ui/
-│   └── app.slint             # Slint UI: Viewfinder, Settings, Gallery, Power pages
+│   └── app.slint             # Slint UI: Viewfinder, Settings (4 tabs), Gallery, Power
 └── setup/
     ├── install.sh            # Kiosk install helper script
-    └── picam.service         # systemd unit file (alternative to bash_profile approach)
+    └── picam.service         # systemd unit (alternative to bash_profile approach)
 ```
 
 ---
 
 ## Media Storage
 
-| Type | Directory |
-|------|-----------|
-| Photos | `/home/pi/Pictures/picam/` |
-| Videos | `/home/pi/Videos/picam/` |
-| Timelapse | `/home/pi/Pictures/timelapse/` |
+| Type | Directory | Filename format |
+|------|-----------|-----------------|
+| Photos | `/home/pi/Pictures/picam/` | `IMG_<ts>.jpg` (+ `.dng` when RAW is enabled) |
+| Burst photos | `/home/pi/Pictures/picam/` | `IMG_<ts>_NN.jpg` |
+| Videos | `/home/pi/Videos/picam/` | `VID_<ts>.mp4` (+ `.thumb.jpg` sidecar) |
+| Timelapse frames | `/home/pi/Pictures/timelapse/session_<ts>/` | `frame_NNNNNN.jpg` |
+| Rendered timelapses | `/home/pi/Pictures/timelapse/` | `timelapse_<ts>.mp4` |
 
 Directories are created on first launch.
 
@@ -212,15 +280,40 @@ SSH into the Pi:
 ssh -i ~/.ssh/id_rsa pi@rpi4-2GB
 ```
 
-`cargo build` (debug) works for iteration. The C++ wrapper is recompiled only when `src/camera_ffi.cpp` or `src/camera_ffi.h` changes. UI changes to `ui/app.slint` require a recompile but incremental builds are fast after the first build.
+`cargo build` (debug) works for iteration. The C++ wrapper recompiles only when `src/camera_ffi.cpp` or `src/camera_ffi.h` changes. UI changes to `ui/app.slint` trigger a Slint codegen pass; incremental Rust builds after that are fast.
 
-Keep `camera_ffi.h` and `camera_ffi.cpp` in sync with the `extern "C"` block in `camera.rs` — any signature change on the C++ side must be reflected in the Rust FFI declarations and vice versa.
+Keep `camera_ffi.h` and `camera_ffi.cpp` in sync with the `extern "C"` block at the top of `src/camera.rs` — any signature change on the C++ side must be reflected in the Rust FFI declarations and vice versa.
 
-To monitor the kiosk log:
+Run tests on the Pi (the camera tests don't touch hardware):
+
+```bash
+cargo test --release
+```
+
+Monitor the kiosk log:
 
 ```bash
 tail -f /tmp/picam-rs.log
 ```
+
+If the running app is hogging CPU during a rebuild, you can free a core with:
+
+```bash
+sudo kill -STOP $(pgrep -x picam)   # suspend (doesn't trigger the cage relaunch loop)
+sudo kill -CONT $(pgrep -x picam)   # resume
+sudo kill -KILL $(pgrep -x picam)   # actually quit; bash loop relaunches in 3s
+```
+
+---
+
+## Roadmap
+
+Coming features (not yet shipped):
+
+- **Histogram overlay** — luminance histogram in the viewfinder corner to verify exposure
+- **Focus peaking** — edge detection overlay on preview to confirm sharp focus through the eyepiece
+- **Screen brightness control** — dim the display further or sleep during long exposures
+- **Video playback** — currently videos show a first-frame thumbnail only; in-app playback is deferred (Slint has no native video widget)
 
 ---
 

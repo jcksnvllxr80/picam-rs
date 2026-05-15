@@ -3,7 +3,7 @@ import { ScrollView } from "std-widgets.slint";
 export enum Page { Viewfinder, Settings, Gallery, Power }
 export enum CaptureMode { Photo, Video, Timelapse }
 export enum TlState { Idle, Running, Rendering }
-export enum SettingsTab { Capture, Image, Advanced }
+export enum SettingsTab { Capture, Image, Advanced, General }
 
 export struct GalleryItem {
     path: string,
@@ -139,7 +139,22 @@ export component AppWindow inherits Window {
     in-out property <int>         photo-res-idx:  0;   // 0=12MP .. 3=FHD
     in-out property <int>         video-res-idx:  0;   // 0=1080p .. 2=480p
     in-out property <int>         tl-res-idx:     0;   // 0=3MP .. 2=720p
+    in-out property <bool>        raw-enabled:    false;
     in-out property <SettingsTab> settings-tab:   SettingsTab.Capture;
+
+    // ── General ───────────────────────────────────────────────────────────────
+    in-out property <int>  self-timer-idx: 0;        // 0=off, 1=2s, 2=5s, 3=10s
+    in-out property <int>  burst-count-idx: 0;       // 0=1, 1=3, 2=5, 3=10
+    in-out property <bool> last-shot-enabled: true;
+    in property    <string> free-space-str: "—";
+
+    // Last-shot review state (managed by Rust, displayed when enabled)
+    in property    <bool>  show-last-shot: false;
+    in property    <image> last-shot-image;
+    // Self-timer countdown (Rust sets to N → 1 → 0; UI shows when > 0)
+    in property    <int>   timer-countdown: 0;
+    // Burst progress (e.g. "3 / 5"); empty when not bursting
+    in property    <string> burst-status: "";
 
     // ── Callbacks ─────────────────────────────────────────────────────────────
     callback capture-photo();
@@ -225,6 +240,49 @@ export component AppWindow inherits Window {
         if root.capturing: Rectangle {
             background: #2a0000;
             opacity: 0.5;
+        }
+
+        // Self-timer countdown overlay
+        if root.timer-countdown > 0: Rectangle {
+            x: 0; y: 0; width: 800px; height: 420px;
+            background: rgba(0,0,0,0.4);
+            Text {
+                text: root.timer-countdown;
+                color: Theme.accent;
+                font-size: 200px;
+                font-weight: 700;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
+
+        // Burst progress badge
+        if root.burst-status != "": Rectangle {
+            x: 600px; y: 10px;
+            width: 180px; height: 32px;
+            background: Theme.overlay;
+            border-radius: 4px;
+            Text {
+                text: "Burst " + root.burst-status;
+                color: Theme.text; font-size: 14px; font-weight: 700;
+                horizontal-alignment: center; vertical-alignment: center;
+            }
+        }
+
+        // Last-shot review overlay
+        if root.show-last-shot: Rectangle {
+            x: 600px; y: 50px;
+            width: 190px; height: 130px;
+            background: Theme.bg;
+            border-width: 2px;
+            border-color: Theme.text;
+            border-radius: 6px;
+            Image {
+                x: 4px; y: 4px;
+                width: 182px; height: 122px;
+                source: root.last-shot-image;
+                image-fit: contain;
+            }
         }
 
         // Mode selector (left column overlay)
@@ -473,6 +531,20 @@ export component AppWindow inherits Window {
                     }
                     clicked => { root.settings-tab = SettingsTab.Advanced; }
                 }
+                TouchArea {
+                    Rectangle {
+                        background: root.settings-tab == SettingsTab.General ? Theme.info : transparent;
+                        border-radius: 6px;
+                        Text {
+                            text: "General";
+                            color: Theme.text;
+                            font-size: 15px;
+                            font-weight: root.settings-tab == SettingsTab.General ? 700 : 400;
+                            horizontal-alignment: center; vertical-alignment: center;
+                        }
+                    }
+                    clicked => { root.settings-tab = SettingsTab.General; }
+                }
             }
         }
 
@@ -498,7 +570,7 @@ export component AppWindow inherits Window {
                     }
                 }
 
-                // Shutter
+                // Shutter — short exposures (row 1)
                 SettingRow { label: "Shutter";
                     HorizontalLayout {
                         x: 120px; spacing: 4px; padding: 4px;
@@ -506,6 +578,18 @@ export component AppWindow inherits Window {
                             label: lbl; active: root.shutter-idx == i; width: 70px;
                             active-color: Theme.info;
                             clicked => { root.shutter-idx = i; }
+                        }
+                    }
+                }
+
+                // Shutter — long exposures (row 2, indices 8-12)
+                SettingRow { label: "(long)";
+                    HorizontalLayout {
+                        x: 120px; spacing: 4px; padding: 4px;
+                        for lbl[j] in ["5s","15s","30s","60s","120s"]: FlatBtn {
+                            label: lbl; active: root.shutter-idx == j + 8; width: 70px;
+                            active-color: Theme.info;
+                            clicked => { root.shutter-idx = j + 8; }
                         }
                     }
                 }
@@ -675,6 +759,86 @@ export component AppWindow inherits Window {
                             active-color: Theme.info;
                             clicked => { root.tl-res-idx = i; }
                         }
+                    }
+                }
+
+                // RAW DNG capture (saves alongside JPEG)
+                SettingRow { label: "RAW (DNG)";
+                    HorizontalLayout {
+                        x: 180px; spacing: 6px; padding: 4px;
+                        FlatBtn {
+                            label: "OFF"; active: !root.raw-enabled;
+                            active-color: Theme.info; width: 80px;
+                            clicked => { root.raw-enabled = false; }
+                        }
+                        FlatBtn {
+                            label: "ON"; active: root.raw-enabled;
+                            active-color: Theme.warn; width: 80px;
+                            clicked => { root.raw-enabled = true; }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── General tab ──
+        if root.settings-tab == SettingsTab.General: Rectangle {
+            x: 0; y: 56px; width: 800px; height: 364px;
+            background: transparent;
+
+            VerticalLayout {
+                x: 0; width: 800px;
+                spacing: 4px;
+                padding-left: 10px; padding-right: 10px;
+
+                // Self-timer
+                SettingRow { label: "Self-Timer";
+                    HorizontalLayout {
+                        x: 180px; spacing: 6px; padding: 4px;
+                        for lbl[i] in ["Off", "2s", "5s", "10s"]: FlatBtn {
+                            label: lbl; active: root.self-timer-idx == i; width: 90px;
+                            active-color: Theme.info;
+                            clicked => { root.self-timer-idx = i; }
+                        }
+                    }
+                }
+
+                // Burst count
+                SettingRow { label: "Burst";
+                    HorizontalLayout {
+                        x: 180px; spacing: 6px; padding: 4px;
+                        for lbl[i] in ["1", "3", "5", "10"]: FlatBtn {
+                            label: lbl; active: root.burst-count-idx == i; width: 90px;
+                            active-color: Theme.info;
+                            clicked => { root.burst-count-idx = i; }
+                        }
+                    }
+                }
+
+                // Last-shot review toggle
+                SettingRow { label: "Last-Shot Review";
+                    HorizontalLayout {
+                        x: 180px; spacing: 6px; padding: 4px;
+                        FlatBtn {
+                            label: "ON"; active: root.last-shot-enabled;
+                            active-color: Theme.info; width: 80px;
+                            clicked => { root.last-shot-enabled = true; }
+                        }
+                        FlatBtn {
+                            label: "OFF"; active: !root.last-shot-enabled;
+                            active-color: Theme.warn; width: 80px;
+                            clicked => { root.last-shot-enabled = false; }
+                        }
+                    }
+                }
+
+                // Storage info (read-only)
+                SettingRow { label: "Storage Free";
+                    Text {
+                        x: 180px; y: 0; height: parent.height;
+                        text: root.free-space-str;
+                        color: Theme.text; font-size: 16px; font-weight: 700;
+                        vertical-alignment: center;
                     }
                 }
             }

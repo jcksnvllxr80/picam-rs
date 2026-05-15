@@ -123,6 +123,12 @@ pub const SHUTTER_SPEEDS: &[(&str, i32)] = &[
     ("1/60",    16_667),
     ("1/30",    33_333),
     ("1s",      1_000_000),
+    // Long exposures for deep-sky astrophotography
+    ("5s",      5_000_000),
+    ("15s",     15_000_000),
+    ("30s",     30_000_000),
+    ("60s",     60_000_000),
+    ("120s",    120_000_000),
 ];
 pub const AWB_MODES: &[&str] = &[
     "auto", "incandescent", "tungsten", "fluorescent", "indoor", "daylight", "cloudy",
@@ -352,34 +358,50 @@ impl Camera {
 
     // ── Photo capture ─────────────────────────────────────────────────────────
 
-    pub fn capture_photo(&self, width: u32, height: u32) -> Result<PathBuf> {
+    pub fn capture_photo(&self, width: u32, height: u32, raw: bool) -> Result<PathBuf> {
         if self.is_recording() {
             anyhow::bail!("Stop recording before taking a photo");
         }
         let ts   = timestamp_ms();
         let path = PathBuf::from(SAVE_DIR).join(format!("IMG_{ts}.jpg"));
         let s    = self.settings.lock().unwrap().clone();
-        let w_str = width.to_string();
-        let h_str = height.to_string();
 
         self.pause_for_capture();
-        let mut cmd = Command::new("rpicam-still");
-        cmd.args([
-            "--output", path.to_str().unwrap(),
-            "--timeout", "200",
-            "--rotation", "180",
-            "--width",  &w_str,
-            "--height", &h_str,
-            "--nopreview",
-            "--immediate",
-        ]);
-        for a in build_rpicam_args(&s) { cmd.arg(a); }
-        let status = cmd.status().context("rpicam-still failed");
+        let status = run_still_capture(&path, width, height, &s, raw);
         self.resume_after_capture();
-
-        let status = status?;
-        if !status.success() { anyhow::bail!("rpicam-still exited {:?}", status.code()); }
+        status?;
         Ok(path)
+    }
+
+    /// Capture multiple frames in one pause/resume cycle.
+    /// Stop bursting if `cancel` flips to true between frames.
+    pub fn capture_burst(
+        &self,
+        count:        usize,
+        width:        u32,
+        height:       u32,
+        raw:          bool,
+        on_progress:  impl Fn(usize, usize) + Send,
+    ) -> Result<Vec<PathBuf>> {
+        if self.is_recording() {
+            anyhow::bail!("Stop recording before taking a photo");
+        }
+        let s = self.settings.lock().unwrap().clone();
+        let mut paths = Vec::with_capacity(count);
+        let ts_base = timestamp_ms();
+
+        self.pause_for_capture();
+        for i in 0..count {
+            on_progress(i + 1, count);
+            let path = PathBuf::from(SAVE_DIR).join(format!("IMG_{ts_base}_{:02}.jpg", i + 1));
+            if let Err(e) = run_still_capture(&path, width, height, &s, raw) {
+                eprintln!("[burst] frame {} failed: {e:#}", i + 1);
+                continue;
+            }
+            paths.push(path);
+        }
+        self.resume_after_capture();
+        Ok(paths)
     }
 
     // Used during photo/timelapse capture only — respects the user's
@@ -502,26 +524,11 @@ impl Camera {
     ) -> Result<PathBuf> {
         let path = PathBuf::from(session_dir).join(format!("frame_{index:06}.jpg"));
         let s    = self.settings.lock().unwrap().clone();
-        let w_str = width.to_string();
-        let h_str = height.to_string();
 
         self.pause_for_capture();
-        let mut cmd = Command::new("rpicam-still");
-        cmd.args([
-            "--output", path.to_str().unwrap(),
-            "--timeout", "200",
-            "--rotation", "180",
-            "--width",  &w_str,
-            "--height", &h_str,
-            "--nopreview",
-            "--immediate",
-        ]);
-        for a in build_rpicam_args(&s) { cmd.arg(a); }
-        let status = cmd.status().context("rpicam-still timelapse failed");
+        let status = run_still_capture(&path, width, height, &s, false);
         self.resume_after_capture();
-
-        let status = status?;
-        if !status.success() { anyhow::bail!("rpicam-still exited {:?}", status.code()); }
+        status?;
         Ok(path)
     }
 
@@ -571,6 +578,57 @@ fn settings_changed(a: &CameraSettings, b: &CameraSettings) -> bool {
         || (a.sharpness  - b.sharpness).abs()  > 0.01
         || (a.brightness - b.brightness).abs() > 0.01
         || (a.zoom       - b.zoom).abs()        > 0.01
+}
+
+fn run_still_capture(
+    path: &std::path::Path,
+    width: u32,
+    height: u32,
+    s: &CameraSettings,
+    raw: bool,
+) -> Result<()> {
+    let w_str = width.to_string();
+    let h_str = height.to_string();
+    // For long exposures, rpicam-still needs the timeout to exceed the shutter
+    // length or it'll cut the exposure short. Pad shutter_us by 500ms.
+    let shutter_us = SHUTTER_SPEEDS[s.shutter_idx.min(SHUTTER_SPEEDS.len() - 1)].1;
+    let timeout_ms = (shutter_us / 1000 + 500).max(200).to_string();
+
+    let mut cmd = Command::new("rpicam-still");
+    cmd.args([
+        "--output",   path.to_str().unwrap(),
+        "--timeout",  &timeout_ms,
+        "--rotation", "180",
+        "--width",    &w_str,
+        "--height",   &h_str,
+        "--nopreview",
+        "--immediate",
+    ]);
+    if raw { cmd.arg("--raw"); }
+    for a in build_rpicam_args(s) { cmd.arg(a); }
+    let status = cmd.status().context("rpicam-still failed")?;
+    if !status.success() {
+        anyhow::bail!("rpicam-still exited {:?}", status.code());
+    }
+    Ok(())
+}
+
+/// Free space on the partition holding photos, formatted like "12.3 GB".
+pub fn free_space_str() -> String {
+    let output = match Command::new("df").args(["-k", SAVE_DIR]).output() {
+        Ok(o) => o,
+        Err(_) => return "—".into(),
+    };
+    let text = String::from_utf8_lossy(&output.stdout);
+    let Some(line) = text.lines().nth(1) else { return "—".into() };
+    let Some(kb_str) = line.split_whitespace().nth(3) else { return "—".into() };
+    let Ok(kb) = kb_str.parse::<u64>() else { return "—".into() };
+    let gb = kb as f32 / 1024.0 / 1024.0;
+    if gb >= 1.0 {
+        format!("{:.1} GB", gb)
+    } else {
+        format!("{} MB", kb / 1024)
+    }
 }
 
 fn timestamp_ms() -> u128 {

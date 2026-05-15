@@ -12,7 +12,11 @@ use camera::{
     Camera, CameraEvent, CameraSettings,
     SAVE_DIR, VIDEO_DIR, TL_DIR,
     PHOTO_RESOLUTIONS, VIDEO_RESOLUTIONS, TL_RESOLUTIONS,
+    free_space_str,
 };
+
+const SELF_TIMER_SECS: &[i32] = &[0, 2, 5, 10];
+const BURST_COUNTS:    &[usize] = &[1, 3, 5, 10];
 
 slint::include_modules!();
 
@@ -75,6 +79,19 @@ fn main() {
                 }
             })
             .expect("spawn frame-pump");
+    }
+
+    // ── Storage free-space updater (every 10s, plus once at startup) ──────────
+    {
+        let handle = handle.clone();
+        thread::Builder::new()
+            .name("free-space".into())
+            .spawn(move || loop {
+                let s = free_space_str();
+                let _ = handle.upgrade_in_event_loop(move |ui| ui.set_free_space_str(s.into()));
+                thread::sleep(Duration::from_secs(10));
+            })
+            .expect("spawn free-space");
     }
 
     // ── Recording duration ticker ─────────────────────────────────────────────
@@ -144,19 +161,67 @@ fn main() {
             let handle  = handle.clone();
             let refresh = refresh.clone();
 
-            // Read settings + resolution while on event-loop thread
-            let (settings, res_idx) = handle.upgrade()
-                .map(|ui| (read_settings(&ui), ui.get_photo_res_idx() as usize))
-                .unwrap_or_default();
+            // Snapshot everything we need from the UI on the event-loop thread
+            let (settings, res_idx, raw, timer_idx, burst_idx, review_on) =
+                handle.upgrade().map(|ui| (
+                    read_settings(&ui),
+                    ui.get_photo_res_idx() as usize,
+                    ui.get_raw_enabled(),
+                    ui.get_self_timer_idx() as usize,
+                    ui.get_burst_count_idx() as usize,
+                    ui.get_last_shot_enabled(),
+                )).unwrap_or_default();
             cam_ref.update_settings(settings);
             let (w, h, _) = PHOTO_RESOLUTIONS[res_idx.min(PHOTO_RESOLUTIONS.len() - 1)];
+            let timer_secs = SELF_TIMER_SECS[timer_idx.min(SELF_TIMER_SECS.len() - 1)];
+            let burst      = BURST_COUNTS    [burst_idx.min(BURST_COUNTS.len() - 1)];
 
             thread::spawn(move || {
+                // Self-timer countdown
+                if timer_secs > 0 {
+                    for n in (1..=timer_secs).rev() {
+                        let _ = handle.upgrade_in_event_loop(move |ui| ui.set_timer_countdown(n));
+                        thread::sleep(Duration::from_secs(1));
+                    }
+                    let _ = handle.upgrade_in_event_loop(|ui| ui.set_timer_countdown(0));
+                }
+
                 let _ = handle.upgrade_in_event_loop(|ui| ui.set_capturing(true));
-                let result = cam_ref.capture_photo(w, h);
+
+                let paths: Vec<std::path::PathBuf> = if burst > 1 {
+                    let h_inner = handle.clone();
+                    let on_progress = move |i: usize, n: usize| {
+                        let s = format!("{i} / {n}");
+                        let _ = h_inner.upgrade_in_event_loop(move |ui| ui.set_burst_status(s.into()));
+                    };
+                    let r = cam_ref.capture_burst(burst, w, h, raw, on_progress);
+                    let _ = handle.upgrade_in_event_loop(|ui| ui.set_burst_status("".into()));
+                    r.unwrap_or_default()
+                } else {
+                    match cam_ref.capture_photo(w, h, raw) {
+                        Ok(p)  => vec![p],
+                        Err(e) => { eprintln!("[photo] {e:#}"); vec![] }
+                    }
+                };
+
                 thread::sleep(Duration::from_millis(150));
                 let _ = handle.upgrade_in_event_loop(|ui| ui.set_capturing(false));
-                if let Err(e) = result { eprintln!("[photo] {e:#}"); } else { refresh(); }
+
+                if let Some(last) = paths.last().cloned() {
+                    // Last-shot review (thumbnail flash for 2 seconds)
+                    if review_on {
+                        let h2 = handle.clone();
+                        let _ = h2.upgrade_in_event_loop(move |ui| {
+                            if let Ok(img) = slint::Image::load_from_path(&last) {
+                                ui.set_last_shot_image(img);
+                                ui.set_show_last_shot(true);
+                            }
+                        });
+                        thread::sleep(Duration::from_secs(2));
+                        let _ = handle.upgrade_in_event_loop(|ui| ui.set_show_last_shot(false));
+                    }
+                    refresh();
+                }
             });
         });
     }
