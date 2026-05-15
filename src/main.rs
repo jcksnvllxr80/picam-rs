@@ -384,6 +384,45 @@ fn main() {
         });
     }
 
+    // Tab tap triggers a rescan — catches captures from /control, side-channel
+    // uploads via SCP, and any other source not routed through on_delete_item.
+    {
+        let refresh = refresh_gallery.clone();
+        app.on_refresh_gallery(move || refresh());
+    }
+
+    // ── Video playback (gallery → ▶ button) ───────────────────────────────────
+    // Spawns mpv fullscreen on the Pi's Wayland session. mpv is a separate
+    // Wayland client to cage; it draws over picam until the user presses Q.
+    // We briefly suspend the libcamera preview so the camera isn't competing
+    // with mpv for the framebuffer — saves CPU during playback.
+    {
+        let cam_ref = Arc::clone(&cam);
+        app.on_play_video(move |path| {
+            let path = path.to_string();
+            let was_streaming = cam_ref.is_stream_enabled();
+            cam_ref.set_stream_enabled(false);
+            let cam_for_resume = Arc::clone(&cam_ref);
+            thread::spawn(move || {
+                let _ = std::process::Command::new("mpv")
+                    .args([
+                        "--fs",
+                        "--no-osc",
+                        "--no-input-default-bindings",
+                        "--input-conf=/dev/null",
+                        // Q, Esc, or any tap on the screen exits
+                        "--really-quiet",
+                        "--keep-open=no",
+                        &path,
+                    ])
+                    .status();
+                if was_streaming {
+                    cam_for_resume.set_stream_enabled(true);
+                }
+            });
+        });
+    }
+
     // ── Stream on/off toggle (Advanced setting) ───────────────────────────────
     {
         let cam_ref = Arc::clone(&cam);

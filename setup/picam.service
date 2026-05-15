@@ -13,6 +13,10 @@ StandardError=journal
 
 Environment=XDG_RUNTIME_DIR=/run/user/1000
 Environment=HOME=/home/pi
+# Empty cursor theme — hides the mouse pointer on the touchscreen.
+# /usr/share/icons/blank/ has touch-empty cursor files + index.theme.
+Environment=XCURSOR_THEME=blank
+Environment=XCURSOR_SIZE=1
 
 # cage creates a Wayland compositor and runs picam fullscreen inside it.
 # -s = launch app immediately, no idle-inhibit overhead.

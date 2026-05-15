@@ -392,10 +392,10 @@ impl Camera {
 
     // ── Stream sinks (called from main.rs in response to UI toggles) ──────────
 
-    pub fn set_local_stream(&self, port: u16) -> Result<()> {
+    pub fn set_local_stream(self: &Arc<Self>, port: u16) -> Result<()> {
         // Drop any existing server first so the port frees up.
         *self.local_stream.lock().unwrap() = None;
-        let server = crate::stream::LocalStream::start(port)?;
+        let server = crate::stream::LocalStream::start(port, Arc::downgrade(self))?;
         *self.local_stream.lock().unwrap() = Some(Arc::new(server));
         Ok(())
     }

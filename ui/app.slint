@@ -37,6 +37,7 @@ component NavBtn inherits TouchArea {
 
     width: 80px;
     height: 60px;
+    mouse-cursor: none;
 
     Rectangle {
         background: active ? Theme.surface : transparent;
@@ -70,6 +71,7 @@ component FlatBtn inherits TouchArea {
 
     width: 90px;
     height: Theme.touch;
+    mouse-cursor: none;
 
     Rectangle {
         border-radius: 6px;
@@ -183,6 +185,8 @@ export component AppWindow inherits Window {
     callback render-timelapse();
     callback delete-item(int);
     callback select-gallery-item(int);
+    callback play-video(string);
+    callback refresh-gallery();
     callback toggle-stream(bool);
     callback toggle-local-stream(bool);
     callback toggle-push-stream(bool);
@@ -345,6 +349,7 @@ export component AppWindow inherits Window {
         // Recording (active) is bright red; idle states are dim red — brightness
         // signals state, so cold fingers can read it at a glance.
         capture-ta := TouchArea {
+            mouse-cursor: none;
             x: 708px; y: 160px;
             width: 84px; height: 100px;
 
@@ -390,6 +395,7 @@ export component AppWindow inherits Window {
 
         // Timelapse render button (appears when TL idle with frames)
         if root.capture-mode == CaptureMode.Timelapse && root.tl-state == TlState.Idle && root.tl-frames > 0: TouchArea {
+                mouse-cursor: none;
             x: 688px; y: 270px;
             width: 104px; height: 48px;
             Rectangle {
@@ -421,6 +427,7 @@ export component AppWindow inherits Window {
 
                 Text { text: "Int:"; color: Theme.dim; font-size: 13px; vertical-alignment: center; }
                 TouchArea {
+                    mouse-cursor: none;
                     width: 48px; height: 48px;
                     Rectangle { background: Theme.surface; border-radius: 6px;
                         Text { text: "−"; color: Theme.text; font-size: 20px;
@@ -437,6 +444,7 @@ export component AppWindow inherits Window {
                 Text { text: root.tl-interval + "s"; color: Theme.text; font-size: 14px;
                        vertical-alignment: center; width: 44px; horizontal-alignment: center; }
                 TouchArea {
+                    mouse-cursor: none;
                     width: 48px; height: 48px;
                     Rectangle { background: Theme.surface; border-radius: 6px;
                         Text { text: "+"; color: Theme.text; font-size: 20px;
@@ -457,6 +465,7 @@ export component AppWindow inherits Window {
 
                 Text { text: "Dur:"; color: Theme.dim; font-size: 13px; vertical-alignment: center; }
                 TouchArea {
+                    mouse-cursor: none;
                     width: 48px; height: 48px;
                     Rectangle { background: Theme.surface; border-radius: 6px;
                         Text { text: "−"; color: Theme.text; font-size: 20px;
@@ -478,6 +487,7 @@ export component AppWindow inherits Window {
                     vertical-alignment: center; width: 56px; horizontal-alignment: center;
                 }
                 TouchArea {
+                    mouse-cursor: none;
                     width: 48px; height: 48px;
                     Rectangle { background: Theme.surface; border-radius: 6px;
                         Text { text: "+"; color: Theme.text; font-size: 20px;
@@ -511,6 +521,7 @@ export component AppWindow inherits Window {
                 padding-top: 6px; padding-bottom: 6px;
 
                 TouchArea {
+                    mouse-cursor: none;
                     Rectangle {
                         background: root.settings-tab == SettingsTab.Capture ? Theme.info : transparent;
                         border-radius: 6px;
@@ -525,6 +536,7 @@ export component AppWindow inherits Window {
                     clicked => { root.settings-tab = SettingsTab.Capture; }
                 }
                 TouchArea {
+                    mouse-cursor: none;
                     Rectangle {
                         background: root.settings-tab == SettingsTab.Image ? Theme.info : transparent;
                         border-radius: 6px;
@@ -539,6 +551,7 @@ export component AppWindow inherits Window {
                     clicked => { root.settings-tab = SettingsTab.Image; }
                 }
                 TouchArea {
+                    mouse-cursor: none;
                     Rectangle {
                         background: root.settings-tab == SettingsTab.Advanced ? Theme.info : transparent;
                         border-radius: 6px;
@@ -553,6 +566,7 @@ export component AppWindow inherits Window {
                     clicked => { root.settings-tab = SettingsTab.Advanced; }
                 }
                 TouchArea {
+                    mouse-cursor: none;
                     Rectangle {
                         background: root.settings-tab == SettingsTab.Stream ? Theme.info : transparent;
                         border-radius: 6px;
@@ -567,6 +581,7 @@ export component AppWindow inherits Window {
                     clicked => { root.settings-tab = SettingsTab.Stream; }
                 }
                 TouchArea {
+                    mouse-cursor: none;
                     Rectangle {
                         background: root.settings-tab == SettingsTab.General ? Theme.info : transparent;
                         border-radius: 6px;
@@ -985,16 +1000,24 @@ export component AppWindow inherits Window {
                 image-fit: contain;
             }
 
-            // Video badge — overlaid on thumbnail so user knows it's a video
-            if root.gallery-items[root.gallery-sel].is-video: Rectangle {
-                x: 350px; y: 200px;
-                width: 100px; height: 80px;
-                background: Theme.overlay;
-                border-radius: 8px;
-                Text {
-                    text: "▶";
-                    color: Theme.text; font-size: 48px;
-                    horizontal-alignment: center; vertical-alignment: center;
+            // Video play button — tapping it spawns mpv fullscreen for playback.
+            if root.gallery-items[root.gallery-sel].is-video: TouchArea {
+                mouse-cursor: none;
+                x: 340px; y: 190px;
+                width: 120px; height: 100px;
+                Rectangle {
+                    background: Theme.overlay;
+                    border-radius: 10px;
+                    border-width: 2px;
+                    border-color: Theme.text;
+                    Text {
+                        text: "▶";
+                        color: Theme.text; font-size: 56px; font-weight: 700;
+                        horizontal-alignment: center; vertical-alignment: center;
+                    }
+                }
+                clicked => {
+                    root.play-video(root.gallery-items[root.gallery-sel].path);
                 }
             }
 
@@ -1009,6 +1032,7 @@ export component AppWindow inherits Window {
                     vertical-alignment: center;
                 }
                 TouchArea {
+                    mouse-cursor: none;
                     x: 696px; y: 4px; width: 96px; height: 48px;
                     Rectangle { background: Theme.accent; border-radius: 6px;
                         Text { text: "Delete"; color: Theme.text; font-size: 14px;
@@ -1019,6 +1043,7 @@ export component AppWindow inherits Window {
                     }
                 }
                 TouchArea {
+                    mouse-cursor: none;
                     x: 592px; y: 4px; width: 96px; height: 48px;
                     Rectangle { background: Theme.surface; border-radius: 6px;
                         Text { text: "Back"; color: Theme.text; font-size: 14px;
@@ -1036,6 +1061,7 @@ export component AppWindow inherits Window {
                 spacing: 2px;
                 padding: 8px;
                 for item[i] in root.gallery-items: TouchArea {
+                mouse-cursor: none;
                     height: 52px;
                     Rectangle {
                         background: Theme.surface;
@@ -1088,6 +1114,7 @@ export component AppWindow inherits Window {
             spacing: 18px;
 
             shutdown-ta := TouchArea {
+            mouse-cursor: none;
                 height: 64px;
                 Rectangle {
                     background: Theme.surface;
@@ -1115,6 +1142,7 @@ export component AppWindow inherits Window {
             }
 
             reboot-ta := TouchArea {
+            mouse-cursor: none;
                 height: 64px;
                 Rectangle {
                     background: Theme.surface;
@@ -1141,6 +1169,7 @@ export component AppWindow inherits Window {
 
             // Restart App is cheap to recover from, so single-tap is fine.
             TouchArea {
+                mouse-cursor: none;
                 height: 56px;
                 Rectangle {
                     background: Theme.info; border-radius: 10px;
@@ -1181,6 +1210,7 @@ export component AppWindow inherits Window {
                 active: root.current-page == Page.Gallery;
                 clicked => {
                     root.gallery-sel = -1;
+                    root.refresh-gallery();
                     root.current-page = Page.Gallery;
                 }
             }
